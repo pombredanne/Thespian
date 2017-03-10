@@ -5,79 +5,6 @@ import tempfile
 from thespian.actors import InvalidActorSpecification
 
 
-###
-### Time Management
-###
-
-def timePeriodSeconds(basis, other=None):
-    if isinstance(basis, datetime):
-        if isinstance(other, datetime):
-            return timePeriodSeconds(other - basis)
-    if isinstance(basis, timedelta):
-        try:
-            return basis.total_seconds()
-        except AttributeError:
-            # Must be Python 2.6... which doesn't have total_seconds yet
-            return (basis.days * 24.0 * 60 * 60) + basis.seconds + (basis.microseconds / 1000.0 / 1000)
-    raise TypeError('Cannot determine time from a %s argument'%str(type(basis)))
-
-
-def toTimeDeltaOrNone(timespec):
-    if timespec is None: return None
-    if isinstance(timespec, timedelta): return timespec
-    if isinstance(timespec, int): return timedelta(seconds=timespec)
-    if isinstance(timespec, float):
-        return timedelta(seconds=int(timespec),
-                         microseconds = int((timespec - int(timespec)) * 1000 * 1000))
-    raise TypeError('Unknown type for timespec: %s'%type(timespec))
-
-
-class ExpiryTime(object):
-    def __init__(self, duration):
-        self._time_to_quit = None if duration is None else (datetime.now() + duration)
-    def expired(self):
-        return False if self._time_to_quit is None else (datetime.now() >= self._time_to_quit)
-    def remaining(self, forever=None):
-        return forever if self._time_to_quit is None else \
-            (timedelta(seconds=0) if datetime.now() > self._time_to_quit else \
-             (self._time_to_quit - datetime.now()))
-    def remainingSeconds(self, forever=None):
-        return forever if self._time_to_quit is None else \
-            (0 if datetime.now() > self._time_to_quit else \
-             timePeriodSeconds(self._time_to_quit - datetime.now()))
-    def __str__(self):
-        if self._time_to_quit is None: return 'Forever'
-        if self.expired():
-            return 'Expired_for_%s'%(datetime.now() - self._time_to_quit)
-        return 'Expires_in_' + str(self.remaining())
-    def __eq__(self, o):
-        if isinstance(o, timedelta):
-            o = ExpiryTime(o)
-        if self._time_to_quit == o._time_to_quit: return True
-        if self._time_to_quit == None or o._time_to_quit == None: return False
-        if self.expired() and o.expired(): return True
-        return abs(self._time_to_quit - o._time_to_quit) < timedelta(microseconds=1)
-    def __lt__(self, o):
-        try:
-            if self._time_to_quit is None and o._time_to_quit is None: return False
-        except Exception: pass
-        if self._time_to_quit is None: return False
-        if isinstance(o, timedelta):
-            o = ExpiryTime(o)
-        if o._time_to_quit is None: return True
-        return self._time_to_quit < o._time_to_quit
-    def __gt__(self, o):
-        try:
-            if self._time_to_quit is None and o._time_to_quit is None: return False
-        except Exception: pass
-        return not self.__lt__(o)
-    def __le__(self, o): return self.__eq__(o) or self.__lt__(o)
-    def __ge__(self, o): return self.__eq__(o) or self.__gt__(o)
-    def __ne__(self, o): return not self.__eq__(o)
-    def __bool__(self): return self.expired()
-    def __nonzero__(self): return self.expired()
-
-
 
 ###
 ### Logging
@@ -248,28 +175,45 @@ except NameError:
     foldl = functools.reduce
 
 
-def partition(testPred, inpList):
-    """Splits a list into two lists: the first list contains the elements
-       that pass the testPred (i.e. testPred(Element) is True), and the
-       second list contains elements that do not pass the testPred."""
-    appLeft  = lambda ll, e: (ll[0]+[e], ll[1])
-    appRight = lambda ll, e: (ll[0],     ll[1]+[e])
+def _append(iterable, value):
+    iterable.append(value)
+    return iterable
+
+
+def join(iterable_of_iterables):
+    return foldl(lambda a, b: a + b, iterable_of_iterables, [])
+
+
+def partition(testPred, inp_iterable, output_type=list):
+    """Splits an iterable (e.g. list) into a tuple of two lists (or other
+       output_type): the first output iterable contains the elements
+       that pass the testPred (i.e. testPred(Element) is True), and
+       the second output iterable contains elements that do not pass
+       the testPred.
+    """
+    appLeft  = lambda ll, e: (_append(ll[0], e), ll[1])
+    appRight = lambda ll, e: (ll[0], _append(ll[1], e))
     appendLeftOrRight = lambda ll, e: (appLeft if testPred(e) else appRight)(ll, e)
-    return foldl(appendLeftOrRight, inpList, ([],[]))
+    return foldl(appendLeftOrRight, inp_iterable, (output_type(), output_type()))
 
 
 
 def fmap(func, obj):
     if isinstance(obj, tuple):
         return tuple(map(functools.partial(fmap, func), obj))
-    iterableitems =  isinstance(obj, list)
+    iterableitems =  isinstance(obj, (list, dict))
     if not iterableitems:
         try:
-            iterableitems = isinstance(obj, (filter, map, zip))
+            iterableitems = isinstance(obj, (filter, map, zip, range))
         except TypeError:
+            # Python2 doesn't have objects like the above.  The
+            # corresponding operations just result in lists which is
+            # already covered.
             pass
     if iterableitems:
-        return map(functools.partial(fmap, func), obj)
+        if hasattr(obj, 'items'):
+            return dict(map(functools.partial(fmap, func), obj.items()))
+        return list(map(functools.partial(fmap, func), obj))
     if hasattr(obj, 'fmap'):
         return obj.fmap(func)
     return func(obj)
@@ -321,11 +265,13 @@ class AssocList(object):
         self._qa = [(A,V) for (A,V) in self._qa if A != addr] + [(addr,val)]
     def rmv(self, addr):
         self._qa = [(A,V) for (A,V) in self._qa if A != addr]
+    def rmv_value(self, val):
+        self._qa = [(A,V) for (A,V) in self._qa if V != val]
     def values(self):
         return [V for (A,V) in self._qa]
     def items(self):
         return self._qa
     def fmap(self, func):
         map(func, self._qa)
-
-
+    def __len__(self):
+        return len(self._qa)

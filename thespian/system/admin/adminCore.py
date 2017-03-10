@@ -1,31 +1,67 @@
 import sys
 import logging
+from datetime import timedelta
+
 from thespian.actors import *
 from thespian.system.utilis import thesplog, AssocList
 from thespian.system.systemCommon import systemCommonBase
 from thespian.system.messages.status import Thespian_SystemStatus
 from thespian.system.messages.admin import *
-from thespian.system.messages.logcontrol import SetLogging
 from thespian.system.transport import TransmitIntent
 from thespian.system.sourceLoader import SourceHashFinder
+from thespian.system.timing import ExpirationTimer
+
+
+
+SOURCE_LOAD_TIMEOUT_PERIOD = timedelta(minutes=2)
+
+
+class PendingSource(object):
+    source_valid = False
+    def __init__(self, srchash, orig_data):
+        self.srchash = srchash
+        self.orig_data = orig_data
+        self.load_expires = ExpirationTimer(SOURCE_LOAD_TIMEOUT_PERIOD)
+        # pending_actors is an array of PendingActor requests waiting
+        # on this source.
+        self.pending_actors = []
+
+class ValidSource(object):
+    source_valid = True
+    def __init__(self, srchash, orig_data, zipsrc, srcinfo):
+        self.srcHash = srchash
+        self.orig_data = orig_data
+        self.zipsrc  = zipsrc
+        self.srcInfo = srcinfo
 
 
 class AdminCore(systemCommonBase):
 
-    def __init__(self, transport, address, capabilities, logdefs):
-        thesplog('++++ Starting Admin from %s', sys.modules['thespian'].__file__, level=logging.DEBUG)
+    def __init__(self, transport, address, capabilities,
+                 logdefs,
+                 concurrency_context):
+        thesplog('++++ Starting Admin from %s',
+                 sys.modules['thespian'].__file__,
+                 level=logging.DEBUG)
         super(AdminCore, self).__init__(address, transport)
+        self.init_replicator(transport, concurrency_context)
         self.capabilities = capabilities
-        self.logdefs      = logdefs
-        self._pendingChildren = {}  # key = childLocalAddr instance #, value = PendingActorEnvelope
+        self.logdefs = logdefs
+        self._pendingChildren = {}  # Use: childLocalAddr instance # : PendingActorEnvelope
         # Things that help us look like an Actor, even though we're not
-        self._sourceHash  = None
-        thesplog('++++ Admin started @ %s / gen %s', self.transport.myAddress, str(ThespianGeneration), level=logging.INFO, primary=True)
+        self._sourceHash = None
+        thesplog('++++ Admin started @ %s / gen %s',
+                 self.transport.myAddress, str(ThespianGeneration),
+                 level=logging.INFO,
+                 primary=True)
+        logging.info('++++ Actor System gen %s started, admin @ %s',
+                     str(ThespianGeneration), self.transport.myAddress)
+        logging.debug('Thespian source: %s', sys.modules['thespian'].__file__)
         self._nannying = AssocList()  # child actorAddress -> parent Address
         self._deadLetterHandler = None
-        self._sources = {}  # Index is sourcehash, value is requestor
-                            # ActorAddress or zipsrc (when validated)
+        self._sources = {}  # Index is sourcehash, value PendingSource or ValidSource
         self._sourceAuthority = None
+        self._sourceNotifications = []  # array of notification addresses
 
 
     def _activate(self):
@@ -38,10 +74,21 @@ class AdminCore(systemCommonBase):
 
     def run(self):
         try:
-            self.transport.run(self.handleIncoming, None)
-        except Exception as ex:
+            while True:
+                r = self.transport.run(self.handleIncoming, None)
+                if isinstance(r, Thespian__UpdateWork):
+                    # tickle the transmit queues
+                    self._send_intent(
+                        TransmitIntent(self.myAddress, r))
+                    continue
+                # Expects that on completion of self.transport.run
+                # that the Actor is done processing and that it has
+                # been shutdown gracefully.
+                break
+        except Exception:
             import traceback
-            thesplog('ActorAdmin uncaught exception: %s', traceback.format_exc(),
+            thesplog('ActorAdmin uncaught exception: %s',
+                     traceback.format_exc(),
                      level=logging.ERROR, exc_info=True)
         thesplog('Admin time to die', level=logging.DEBUG)
 
@@ -51,20 +98,25 @@ class AdminCore(systemCommonBase):
         handled, result = self._handleReplicatorMessages(envelope)
         if handled:
             return result
-        if isinstance(envelope.message, (ActorSystemMessage, logging.LogRecord)):
+        if isinstance(envelope.message, (ActorSystemMessage,
+                                         logging.LogRecord)):
             thesplog('Admin of %s', envelope.identify(), level=logging.DEBUG)
             return getattr(self,
-                           'h_' + envelope.message.__class__.__name__, self.unrecognized)(envelope)
+                           'h_' + envelope.message.__class__.__name__,
+                           self.unrecognized)(envelope)
         # else discard random non-admin messages
         self._sCBStats.inc('Admin Message Received.Ignored')
-        thesplog('ADMIN DISCARD %s', envelope.identify(), level=logging.WARNING)
+        thesplog('ADMIN DISCARD %s', envelope.identify(),
+                 level=logging.WARNING)
         return True
 
 
     def unrecognized(self, envelope):
         self._sCBStats.inc('Admin Message Received.Discarded')
-        thesplog("Admin got incoming %s from %s; discarded because I don't know how to handle it!",
-                 envelope.message, envelope.sender, level=logging.WARNING, primary=True)
+        thesplog("Admin got incoming %s from %s;"
+                 " discarded because I don't know how to handle it!",
+                 envelope.message, envelope.sender,
+                 level=logging.WARNING, primary=True)
         return True
 
 
@@ -74,23 +126,24 @@ class AdminCore(systemCommonBase):
     def h_QueryExists(self, envelope):
         self._sCBStats.inc('Admin Message Received.Type.QueryExists')
         self._send_intent(
-            TransmitIntent(envelope.sender,
-                           QueryAck(
-                               self.capabilities.get('Thespian ActorSystem Name',
-                                                     'misc Actor System'),
-                               self.capabilities.get('Thespian ActorSystem Version',
-                                                     'unknown Version'),
-                               self.isShuttingDown())))
+            TransmitIntent(
+                envelope.sender,
+                QueryAck(
+                    self.capabilities.get('Thespian ActorSystem Name',
+                                          'misc Actor System'),
+                    self.capabilities.get('Thespian ActorSystem Version',
+                                          'unknown Version'),
+                    self.isShuttingDown())))
         return True
 
 
     def getStatus(self):
         resp = Thespian_SystemStatus(self.myAddress,
-                                     capabilities = self.capabilities,
-                                     inShutdown = self.isShuttingDown())
+                                     capabilities=self.capabilities,
+                                     inShutdown=self.isShuttingDown())
         resp.setDeadLetterHandler(self._deadLetterHandler)
         self._updateStatusResponse(resp)
-        resp.setLoadedSources(list(self._sources.keys()))
+        resp.setLoadedSources(self._sources)
         resp.sourceAuthority = self._sourceAuthority
         return resp
 
@@ -122,7 +175,8 @@ class AdminCore(systemCommonBase):
 
     def h_SystemShutdown(self, envelope):
         self._exiting = envelope.sender
-        thesplog('---- shutdown initiated by %s', envelope.sender, level=logging.DEBUG)
+        thesplog('---- shutdown initiated by %s', envelope.sender,
+                 level=logging.DEBUG)
 
         # Send failure notices and clear out any pending children.  If
         # any pending child ready notifications are received after
@@ -136,7 +190,7 @@ class AdminCore(systemCommonBase):
                         pendingReq.message.forActor,
                         pendingReq.message.instanceNum,
                         pendingReq.message.globalName,
-                        errorCode = PendingActorResponse.ERROR_ActorSystem_Shutting_Down)))
+                        errorCode=PendingActorResponse.ERROR_ActorSystem_Shutting_Down)))
         self._pendingChildren = []
 
         if not self.childAddresses:  # no children?
@@ -147,21 +201,43 @@ class AdminCore(systemCommonBase):
         # Now shutdown any direct children
         self._killLocalActors()
 
-        # Once children confirm their exits the callback will shutdown the Admin.
+        # Callback will shutdown the Admin Once the children confirm
+        # their exits.
         return True
+
+
+    def _remove_expired_sources(self):
+        rmvlist = []
+        for each in self._sources:
+            if not self._sources[each].source_valid and \
+               self._sources[each].load_expires.expired():
+                rmvlist.append(each)
+        for each in rmvlist:
+            self._cancel_pending_actors(self._sources[each].pending_actors)
+            del self._sources[each]
+
+    def _cancel_pending_actors(self, pending_envelopes,
+                               error_code=PendingActorResponse.ERROR_Invalid_SourceHash):
+        for each in pending_envelopes:
+            self._sendPendingActorResponse(each, None, errorCode = error_code)
+
 
 
     def _killLocalActors(self):
         for each in self.childAddresses:
             self._send_intent(
                 TransmitIntent(each, ActorExitRequest(recursive=True),
-                               onError=lambda r,m: self._handleChildExited(each)))
+                               onError=lambda r, m, a=each:
+                               self._handleChildExited(a)))
 
 
     def _sayGoodbye(self):
         self._cleanupAdmin()
-        self._send_intent(TransmitIntent(self._exiting, SystemShutdownCompleted()))
+        self._send_intent(TransmitIntent(self._exiting,
+                                         SystemShutdownCompleted()))
         thesplog('---- shutdown completed', level=logging.INFO)
+        logging.info('---- Actor System shutdown')
+        self.shutdown_completed = True
 
 
     def h_ChildActorExited(self, envelope):
@@ -169,6 +245,8 @@ class AdminCore(systemCommonBase):
 
 
     def _handleChildExited(self, childAddress):
+        self._sourceNotifications = list(filter(lambda a: a != childAddress,
+                                                self._sourceNotifications))
         parentAddr = self._nannying.find(childAddress)
         if parentAddr:
             self._nannying.rmv(childAddress)
@@ -181,27 +259,40 @@ class AdminCore(systemCommonBase):
 
     def h_PendingActor(self, envelope):
         """Admin is creating an Actor.  This covers one of the following cases:
+
             1. Creating for external requester via ActorSystem.
                   envelope.message.forActor will be None
                The Admin is the "parent" for all externally-created Actors.
-            2. Creating for another Actor when direct creation fails.  Usually means
-               that the current ActorSyste cannot meet the new Actor's requirements
-               and the Admin should find another convention member that can create
-               the new Actor.
-            3. GlobalName Actor.  The Admin is the "parent" for all GlobalName Actors.
+
+            2. Creating for another Actor when direct creation fails.
+               Usually means that the current ActorSyste cannot meet
+               the new Actor's requirements and the Admin should find
+               another convention member that can create the new
+               Actor.
+
+            3. GlobalName Actor.  The Admin is the "parent" for all
+               GlobalName Actors.
+
         """
         self._sCBStats.inc('Admin Message Received.Type.Pending Actor Request')
 
         if self.isShuttingDown():
-            self._sendPendingActorResponse(envelope, None,
-                                           errorCode = PendingActorResponse.ERROR_ActorSystem_Shutting_Down)
+            self._sendPendingActorResponse(
+                envelope, None,
+                errorCode=PendingActorResponse.ERROR_ActorSystem_Shutting_Down)
             return True
 
         sourceHash = envelope.message.sourceHash
-        if sourceHash and sourceHash not in self._sources:
-            self._sendPendingActorResponse(envelope, None,
-                                           errorCode = PendingActorResponse.ERROR_Invalid_SourceHash)
-            return True
+        if sourceHash:
+            self._remove_expired_sources()
+            if sourceHash not in self._sources:
+                self._sendPendingActorResponse(
+                    envelope, None,
+                    errorCode = PendingActorResponse.ERROR_Invalid_SourceHash)
+                return True
+            if not self._sources[sourceHash].source_valid:
+                self._sources[sourceHash].pending_actors.append(envelope)
+                return True
 
         # Note, both Admin and remote requester will have a local
         # child address for the child (with a different instanceNumber
@@ -210,16 +301,18 @@ class AdminCore(systemCommonBase):
         childInstance = childAddr.addressDetails.addressInstanceNum
 
         try:
-            self._startChildActor(childAddr, envelope.message.actorClassName,
-                                  parentAddr = self.myAddress, # Admin is surrogate parent
-                                  notifyAddr = self.myAddress,
-                                  childRequirements = envelope.message.targetActorReq,
-                                  sourceHash = sourceHash,
-                                  sourceToLoad = (self._sources[sourceHash]
-                                                  if sourceHash else None))
+            self._startChildActor(
+                childAddr, envelope.message.actorClassName,
+                parentAddr=self.myAddress,  # Admin is surrogate parent
+                notifyAddr=self.myAddress,
+                childRequirements=envelope.message.targetActorReq,
+                sourceHash=sourceHash,
+                sourceToLoad=(self._sources[sourceHash]
+                              if sourceHash else None))
         except NoCompatibleSystemForActor:
-            self._sendPendingActorResponse(envelope, None,
-                                           errorCode = PendingActorResponse.ERROR_No_Compatible_ActorSystem)
+            self._sendPendingActorResponse(
+                envelope, None,
+                errorCode=PendingActorResponse.ERROR_No_Compatible_ActorSystem)
             self._retryPendingChildOperations(childInstance, None)
             return True
 
@@ -230,23 +323,24 @@ class AdminCore(systemCommonBase):
 
 
     def _sendPendingActorResponse(self, requestEnvelope, actualAddress,
-                                  errorCode = None, errorStr = None):
+                                  errorCode=None, errorStr=None):
         # actualAddress is None for failure
         if actualAddress is None and errorCode is None:
             raise ValueError('Must specify either actualAddress or errorCode')
         self._send_intent(
-            TransmitIntent(requestEnvelope.message.forActor or requestEnvelope.sender,
-                           PendingActorResponse(requestEnvelope.message.forActor,
-                                                requestEnvelope.message.instanceNum,
-                                                requestEnvelope.message.globalName,
-                                                errorCode = errorCode,
-                                                errorStr = errorStr,
-                                                actualAddress = actualAddress)))
+            TransmitIntent(
+                requestEnvelope.message.forActor or requestEnvelope.sender,
+                PendingActorResponse(requestEnvelope.message.forActor,
+                                     requestEnvelope.message.instanceNum,
+                                     requestEnvelope.message.globalName,
+                                     errorCode=errorCode,
+                                     errorStr=errorStr,
+                                     actualAddress=actualAddress)))
 
 
     def _pendingActorReady(self, childInstance, actualAddress):
         if childInstance not in self._pendingChildren:
-            thesplog('Pending actor is ready at %s for %s but latter is unknown'
+            thesplog('Pending actor is ready at %s for UNKNOWN %s'
                      '; sending child a shutdown',
                      actualAddress, childInstance, level=logging.WARNING)
             self._send_intent(
@@ -267,8 +361,11 @@ class AdminCore(systemCommonBase):
         if requestEnvelope.message.forActor:
             # Proxy-parenting; remember the real parent
             self._nannying.add(actualAddress, requestEnvelope.message.forActor)
-        self._addrManager.associateUseableAddress(self.myAddress, childInstance, actualAddress)
-        # n.b. childInstance is for this Admin, but caller's childInstance is in original request
+        self._addrManager.associateUseableAddress(self.myAddress,
+                                                  childInstance,
+                                                  actualAddress)
+        # n.b. childInstance is for this Admin, but caller's
+        # childInstance is in original request
         self._sendPendingActorResponse(requestEnvelope, actualAddress)
         self._retryPendingChildOperations(childInstance, actualAddress)
 
@@ -296,17 +393,43 @@ class AdminCore(systemCommonBase):
         self._sourceAuthority = envelope.message.authorityAddress
 
 
+    def h_NotifyOnSourceAvailability(self, envelope):
+        address = envelope.message.notificationAddress
+        enable = envelope.message.enable
+        all_except = [A for A in self._sourceNotifications if A != address]
+        if enable:
+            self._sourceNotifications = all_except + [address]
+            for each in self._sources:
+                if self._sources[each].source_valid:
+                    self._send_intent(
+                        TransmitIntent(address,
+                                       LoadedSource(self._sources[each].srcHash,
+                                                    self._sources[each].srcInfo)))
+        else:
+            self._sourceNotifications = all_except
+
+
     def h_ValidateSource(self, envelope):
+        self._remove_expired_sources()
         sourceHash = envelope.message.sourceHash
         if not envelope.message.sourceData:
             self.unloadActorSource(sourceHash)
-            logging.getLogger('Thespian').info('Source hash %s unloaded', sourceHash)
+            logging.getLogger('Thespian')\
+                   .info('Source hash %s unloaded', sourceHash)
             return
-        if sourceHash in self._sources:
-            logging.getLogger('Thespian').info('Source hash %s already loaded', sourceHash)
+        if sourceHash in self._sources and \
+           self._sources[sourceHash].source_valid:
+            logging.getLogger('Thespian')\
+                   .info('Source hash %s (%s) already loaded', sourceHash,
+                         self._sources[sourceHash].srcInfo
+                         if isinstance(self._sources[sourceHash], ValidSource)
+                         else '<pending>')
             return
         if self._sourceAuthority:
-            self._send_intent(TransmitIntent(self._sourceAuthority, envelope.message))
+            self._sources[sourceHash] = PendingSource(sourceHash,
+                                                      envelope.message.sourceData)
+            self._send_intent(TransmitIntent(self._sourceAuthority,
+                                             envelope.message))
             return
         # Any attempt to load sources is ignored if there is no active
         # Source Authority.  This is a security measure to protect the
@@ -316,33 +439,91 @@ class AdminCore(systemCommonBase):
             sourceHash)
 
     def h_ValidatedSource(self, envelope):
-        self._loadValidatedActorSource(envelope.message.sourceHash,
-                                       envelope.message.sourceZip)
-        thesplog('Source hash %s validated by Source Authority; now available.',
-                 envelope.message.sourceHash)
+        self._remove_expired_sources()
+        if envelope.sender != self._sourceAuthority:
+            logging.getLogger('Thespian').warning(
+                'Ignoring validated source from %s: not the source authority at %s',
+                envelope.sender, self._sourceAuthority)
+            return
+        source_hash = envelope.message.sourceHash
+        if envelope.message.sourceZip:
+            self._loadValidatedActorSource(
+                source_hash,
+                envelope.message.sourceZip,
+                getattr(envelope.message, 'sourceInfo', None))
+            logging.getLogger('Thespian').info(
+                'Source hash %s (%s) validated by Source Authority'
+                '; now available.',
+                source_hash,
+                getattr(envelope.message, 'sourceInfo', '-'))
+        else:
+            # Source Authority actively rejected this source, so
+            # actively unloaded it.  Alternatively the Source
+            # Authority can do nothing and this load attempt will
+            # timeout.
+            self._cancel_pending_actors(
+                self._sources[source_hash].pending_actors)
+            logging.getLogger('Thespian').warning(
+                'Source hash %s (%s) REJECTED by Source Authority',
+                source_hash,
+                getattr(envelope.message, 'sourceInfo', '-'))
+            del self._sources[source_hash]
 
-    def _loadValidatedActorSource(self, sourceHash, sourceZip):
+    def _loadValidatedActorSource(self, sourceHash, sourceZip, sourceInfo):
         # Validate the source file; this doesn't actually utilize the
         # sourceZip, but it ensures that the sourceZip isn't garbage
         # before registering it as active source.
+        if sourceHash not in self._sources:
+            logging.getLogger('Thespian').warning(
+                'Provided validated source with no or expired request'
+                ', hash %s; ignoring.', sourceHash)
+            return
+
         try:
             f = SourceHashFinder(sourceHash, lambda v: v, sourceZip)
             namelist = f.getZipNames()
             logging.getLogger('Thespian').info(
-                'Validated source hash %s, %s modules (%s)',
-                sourceHash, len(namelist),
+                'Validated source hash %s - %s, %s modules (%s)',
+                sourceHash, sourceInfo, len(namelist),
                 ', '.join(namelist if len(namelist) < 10 else
                           namelist[:9] + ['...']))
         except Exception as ex:
-            logging.getLogger('Thespian').error('Validated source (hash %s) is corrupted: %s',
-                                                sourceHash, ex)
+            logging.getLogger('Thespian')\
+                   .error('Validated source (hash %s) is corrupted: %s',
+                          sourceHash, ex)
+            return
+
+        if self._sources[sourceHash].source_valid:
+            # If a duplicate source load request is made while the
+            # first is still being validated by the Source Authority,
+            # another request will be sent to the Source Authority and
+            # the latter response will be a duplicate here and can
+            # simply be dropped.
             return
 
         # Store this registered source
-        self._sources[sourceHash] = sourceZip
+        pending_actors = self._sources[sourceHash].pending_actors
+
+        self._sources[sourceHash] = ValidSource(sourceHash,
+                                                self._sources[sourceHash].orig_data,
+                                                sourceZip,
+                                                str(sourceInfo))
+
+        for each in pending_actors:
+            self.h_PendingActor(each)
+
+        msg = LoadedSource(self._sources[sourceHash].srcHash,
+                           self._sources[sourceHash].srcInfo)
+        for each in self._sourceNotifications:
+            self._send_intent(TransmitIntent(each, msg))
+
 
     def unloadActorSource(self, sourceHash):
         if sourceHash in self._sources:
+            msg = UnloadedSource(self._sources[sourceHash].srcHash,
+                                 self._sources[sourceHash].srcInfo)
+            for each in self._sourceNotifications:
+                self._send_intent(TransmitIntent(each, msg))
             del self._sources[sourceHash]
         for pnum, metapath in enumerate(sys.meta_path):
             if getattr(metapath, 'srcHash', None) == sourceHash:
@@ -375,4 +556,3 @@ class AdminCore(systemCommonBase):
         newCaps = NewCapabilities(self.capabilities, self.myAddress)
         for each in self.childAddresses:
             self._send_intent(TransmitIntent(each, newCaps))
-

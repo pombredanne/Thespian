@@ -1,4 +1,4 @@
-from thespian.system.admin.convention import HysteresisDelaySender
+from thespian.system.transport.hysteresis import HysteresisDelaySender
 from thespian.system.transport import TransmitIntent, SendStatus
 from datetime import datetime, timedelta
 from time import sleep
@@ -9,8 +9,7 @@ class TestUnitHysteresis(object):
     def send(self, intent):
         if not hasattr(self, 'sends'): self.sends = []
         self.sends.append(intent)
-        intent.result = SendStatus.Sent
-        intent.completionCallback()
+        intent.tx_done(SendStatus.Sent)
 
     def successfulIntent(self, err, intent):
         if not hasattr(self, 'successes'): self.successes = []
@@ -233,11 +232,11 @@ class TestUnitHysteresis(object):
         sleep(hs.delay.remainingSeconds())
         hs.checkSends()
         # Only should have first message and last of each type
-        assert 4 == len(getattr(self, 'sends', []))
+        print('sends: %s' % [str(S.message) for S in self.sends])
+        assert 3 == len(getattr(self, 'sends', []))
         assert intents[0] == self.sends[0]
         assert intents[-3] == self.sends[1]
-        assert intents[-2] == self.sends[2]
-        assert intents[-1] == self.sends[3]
+        assert intents[-1] == self.sends[2]
 
     def testTwentySendsSameAddressSameMessageTypeSendAfterDelay(self):
         self.sends = []

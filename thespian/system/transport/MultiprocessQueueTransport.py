@@ -49,11 +49,12 @@ testActorAdder.py:test07_LotsOfActorsEveryTenWithBackground (deadlocks
 
 import logging
 from thespian.actors import *
-from thespian.system.utilis import (ExpiryTime, thesplog, partition, foldl, fmap,
-                                    AssocList)
+from thespian.system.utilis import thesplog, partition, foldl, AssocList
+from thespian.system.timing import timePeriodSeconds
 from thespian.system.transport import *
 from thespian.system.transport.asyncTransportBase import asyncTransportBase
 from thespian.system.transport.wakeupTransportBase import wakeupTransportBase
+from thespian.system.messages.multiproc import ChildMayHaveDied
 from thespian.system.addressManager import ActorLocalAddress
 from multiprocessing import Queue
 try:
@@ -61,11 +62,16 @@ try:
 except ImportError:
     import queue as Q  # Python 3
 from datetime import datetime
-import pickle
+try:
+    import cPickle as pickle
+except Exception:
+    import pickle
 
 
 MAX_ADMIN_QUEUESIZE=40  # depth of Admin queue
 MAX_ACTOR_QUEUESIZE=10  # depth of Actor queue
+MAX_QUEUE_TRANSMIT_PERIOD = timedelta(seconds=20)  # always local, so shorter times are appropriate
+QUEUE_CHECK_PERIOD = 2  # maximum sleep time in seconds on Q get
 
 
 class QueueActorAddress(object):  # internal use by this module only
@@ -89,6 +95,317 @@ class MpQTEndpoint(TransportInit__Base):  # internal use by this module only
     def addrInst(self): return self.args[0]
 
 
+class MultiprocessQueueTCore_Common(object):
+    def __init__(self, myQueue, parentQ, adminQ, adminAddr):
+        self._myInputQ   = myQueue
+        self._parentQ    = parentQ
+        self._adminQ     = adminQ
+        self._adminAddr  = adminAddr
+
+        # _queues is a map of direct child ActorAddresses to Queue instance.  Note
+        # that there will be multiple keys mapping to the same Queue
+        # instance because routing is only either to the Parent or to
+        # an immediate Child.
+        self._queues = AssocList()  # addr -> queue
+
+        # _fwdvia represents routing for other than immediate parent
+        # or child (there may be multiple target addresses mapping to
+        # the same forward address.
+        self._fwdvia = AssocList()  # targetAddress -> fwdViaAddress
+
+        self._deadaddrs = []
+
+        # Signals can set these to true; they should be checked and
+        # reset by the main processing loop.  There is a small window
+        # where they could be missed because signals are not queued,
+        # but this should handle the majority of situations.  Note
+        # that the Queue object is NOT signal-safe, so don't try to
+        # queue signals that way.
+
+        self._checkChildren = False
+        self._shutdownSignalled = False
+
+
+    def mainLocalInputQueueEndpoint(self): return self._myInputQ
+    def adminQueueEndpoint(self): return self._adminQ
+    @property
+    def adminAddr(self): return self._adminAddr
+
+    def protectedFileNumList(self):
+        return foldl(lambda a, b: a+[b._reader.fileno(), b._writer.fileno()],
+                     [self._myInputQ, self._parentQ, self._adminQ] +
+                     list(self._queues.values()), [])
+
+
+    def childResetFileNumList(self):
+        return foldl(lambda a, b: a+[b._reader.fileno(), b._writer.fileno()],
+                     [self._parentQ] +
+                     list(self._queues.values()), [])
+
+
+    def add_endpoint(self, child_addr, child_queue):
+        self._queues.add(child_addr, child_queue)
+
+
+    def set_address_to_dead(self, child_addr):
+        self._queues.rmv(child_addr)
+        self._fwdvia.rmv(child_addr)
+        self._fwdvia.rmv_value(child_addr)
+        self._deadaddrs.append(child_addr)
+
+
+    def abort_core_run(self):
+        self._aborting_run = True
+
+
+    def core_common_transmit(self, transmit_intent, from_addr):
+        try:
+            if self.isMyAddress(transmit_intent.targetAddr):
+                if transmit_intent.message:
+                    self._myInputQ.put( (from_addr, transmit_intent.serMsg),
+                                        True,
+                                        timePeriodSeconds(transmit_intent.delay()))
+            else:
+                tgtQ = self._queues.find(transmit_intent.targetAddr)
+                if tgtQ:
+                    tgtQ.put((from_addr, transmit_intent.serMsg), True,
+                             timePeriodSeconds(transmit_intent.delay()))
+                else:
+                    # None means sent by parent, so don't send BACK to parent if unknown
+                    topOrFromBelow = from_addr if self._parentQ else None
+                    (self._parentQ or self._adminQ).put(
+                        (topOrFromBelow, transmit_intent.serMsg),
+                        True,
+                        timePeriodSeconds(transmit_intent.delay()))
+
+            transmit_intent.tx_done(SendStatus.Sent)
+            return
+        except Q.Full:
+            pass
+        transmit_intent.tx_done(SendStatus.DeadTarget if not isinstance(
+            transmit_intent._message,
+            (ChildActorExited, ActorExitRequest)) else SendStatus.Failed)
+
+
+    def core_common_receive(self, incoming_handler, for_local_addr, run_time_f):
+        """Core scheduling method; called by the current Actor process when
+           idle to await new messages (or to do background
+           processing).
+        """
+        if incoming_handler == TransmitOnly or \
+           isinstance(incoming_handler, TransmitOnly):
+            # transmits are not queued/multistage in this transport, no waiting
+            return 0
+
+        self._aborting_run = False
+
+        while not run_time_f().expired() and not self._aborting_run:
+            try:
+                # Unfortunately, the Queue object is not signal-safe,
+                # so a frequent wakeup is needed to check
+                # _checkChildren and _shutdownSignalled.
+                rcvd = self._myInputQ.get(True,
+                                          min(run_time_f().remainingSeconds() or
+                                              QUEUE_CHECK_PERIOD,
+                                              QUEUE_CHECK_PERIOD))
+            except Q.Empty:
+                if not self._checkChildren and not self._shutdownSignalled:
+                    # Probably a timeout, but let the while loop decide for sure
+                    continue
+                rcvd = 'BuMP'
+            if rcvd == 'BuMP':
+                relayAddr = sendAddr = destAddr = for_local_addr
+                if self._checkChildren:
+                    self._checkChildren = False
+                    msg = ChildMayHaveDied()
+                elif self._shutdownSignalled:
+                    self._shutdownSignalled = False
+                    msg = ActorExitRequest()
+                else:
+                    return Thespian__UpdateWork()
+            else:
+                relayAddr, (sendAddr, destAddr, msg) = rcvd
+            if not self._queues.find(sendAddr):
+                # We don't directly know about this sender, so
+                # remember what path this arrived on to know where to
+                # direct future messages for this sender.
+                if relayAddr and self._queues.find(relayAddr) and \
+                   not self._fwdvia.find(sendAddr):
+                    # relayAddr might be None if it's our parent, which is OK because
+                    # the default message forwarding is to the parent.  If it's not
+                    # none, it should be in self._queues though!
+                    self._fwdvia.add(sendAddr, relayAddr)
+            if hasattr(self, '_addressMgr'):
+                destAddr,msg = self._addressMgr.prepMessageSend(destAddr, msg)
+            if destAddr is None:
+                thesplog('Unexpected target inaccessibility for %s', msg,
+                         level = logging.WARNING)
+                raise CannotPickleAddress(destAddr)
+
+            if msg is SendStatus.DeadTarget:
+                thesplog('Faking message "sent" because target is dead and recursion avoided.')
+                continue
+
+            if self.isMyAddress(destAddr):
+                if incoming_handler is None:
+                    return ReceiveEnvelope(sendAddr, msg)
+                r = incoming_handler(ReceiveEnvelope(sendAddr, msg))
+                if not r:
+                    return r  # handler returned False, indicating run() should exit
+            else:
+                # Note: the following code has implicit knowledge of serialize() and xmit
+                putQValue = lambda relayer: (relayer, (sendAddr, destAddr, msg))
+                deadQValue = lambda relayer: (relayer, (sendAddr,
+                                                        self._adminAddr,
+                                                        DeadEnvelope(destAddr, msg)))
+                # Must forward this packet via a known forwarder or our parent.
+                send_dead = False
+                tgtQ = self._queues.find(destAddr)
+                if tgtQ:
+                    sendArgs = putQValue(for_local_addr), True
+                if not tgtQ:
+                    tgtA = self._fwdvia.find(destAddr)
+                    if tgtA:
+                        tgtQ = self._queues.find(tgtA)
+                        sendArgs = putQValue(None),
+                    else:
+                        for each in self._deadaddrs:
+                            if destAddr == each:
+                                send_dead = True
+                if tgtQ:
+                    try:
+                        tgtQ.put(*sendArgs,
+                                 timeout=timePeriodSeconds(MAX_QUEUE_TRANSMIT_PERIOD))
+                        continue
+                    except Q.Full:
+                        thesplog('Unable to send msg %s to dest %s; dead lettering',
+                                 msg, destAddr)
+                        send_dead = True
+                if send_dead:
+                    try:
+                        (self._parentQ or self._adminQ).put(
+                            deadQValue(for_local_addr if self._parentQ else None),
+                            True,
+                            timePeriodSeconds(MAX_QUEUE_TRANSMIT_PERIOD))
+                    except Q.Full:
+                        thesplog('Unable to send deadmsg %s to %s or admin; discarding',
+                                 msg, destAddr)
+                    continue
+
+                # Not sure how to route this message yet.  It
+                # could be a heretofore silent child of one of our
+                # children, it could be our parent (whose address
+                # we don't know), or it could be elsewhere in the
+                # tree.
+                #
+                # Try sending it to the parent first.  If the
+                # parent can't determine the routing, it will be
+                # sent back down (relayAddr will be None in that
+                # case) and it must be sprayed out to all children
+                # in case the target lives somewhere beneath us.
+                # Note that _parentQ will be None for top-level
+                # actors, which send up to the Admin instead.
+                #
+                # As a special case, the external system is the
+                # parent of the admin, but the admin is the
+                # penultimate parent of all others, so this code
+                # must keep the admin and the parent from playing
+                # ping-pong with the message.  But... the message
+                # might be directed to the external system, which
+                # is the parent of the Admin, so we need to check
+                # with it first.
+                #   parentQ == None but adminQ good --> external
+                #   parentQ and adminQ and myAddress == adminAddr --> Admin
+                #   parentQ and adminQ and myAddress != adminADdr --> other Actor
+
+                if relayAddr:
+                    # Send message up to the parent to see if the
+                    # parent knows how to forward it
+                    try:
+                        (self._parentQ or self._adminQ).put(
+                            putQValue(for_local_addr if self._parentQ else None),
+                            True,
+                            timePeriodSeconds(MAX_QUEUE_TRANSMIT_PERIOD))
+                    except Q.Full:
+                        thesplog('Unable to send dead msg %s to %s or admin; discarding',
+                                 msg, destAddr)
+                else:
+                    # Sent by parent or we are an external, so this
+                    # may be some grandchild not currently known.
+                    # Do the worst case and just send this message
+                    # to ALL immediate children, hoping it will
+                    # get there via some path.
+                    for A,AQ in self._queues.items():
+                        if A not in [self._adminAddr, str(self._adminAddr)]:
+                            # None means sent by Parent, so don't
+                            # send BACK to parent if unknown
+                            try:
+                                AQ.put(putQValue(None),
+                                       True,
+                                       timePeriodSeconds(MAX_QUEUE_TRANSMIT_PERIOD))
+                            except Q.Full:
+                                pass
+        return None
+
+
+    def interrupt_run(self, signal_shutdown=False, check_children=False):
+        self._shutdownSignalled |= signal_shutdown
+        self._checkChildren |= check_children
+        # Do not put anything on the Queue if running in the context
+        # of a signal handler, because Queues are not signal-context
+        # safe.  Instead, those will just have to depend on the short
+        # maximum Queue get wait time.
+        if not signal_shutdown and not check_children:
+            self._myInputQ.put_nowait('BuMP')
+
+
+class MultiprocessQueueTCore_Actor(MultiprocessQueueTCore_Common):
+    # Transport core for an Actor.  All access here is
+    # single-threaded, and there is only ever one address, so this is
+    # a simple interface.
+
+    def __init__(self, myQueue, parentQ, adminQ, adminAddr, myAddr):
+        super(MultiprocessQueueTCore_Actor, self).__init__(myQueue, parentQ,
+                                                           adminQ, adminAddr)
+        self._myAddr = myAddr
+
+    def isMyAddress(self, addr):
+        return addr == self._myAddr
+
+    def core_transmit(self, transmitIntent):
+        return self.core_common_transmit(transmitIntent, self._myAddr)
+
+    def core_receive(self, inc_handler, run_time_f):
+        return self.core_common_receive(inc_handler, self._myAddr, run_time_f)
+
+
+class MultiprocessQueueTCore_External(MultiprocessQueueTCore_Common):
+    # Transport core for an External interface.  There may be multiple
+    # External interfaces (generated by the ActorSystem.private()
+    # context generator), each represented by a
+    # MultiprocessQueueTransport object, but all sharing this single
+    # core object.  There can be only one input multiprocess.Queue for
+    # this process, which is managed by this object.  Only one thread
+    # can be waiting at a time, but each MultiprocessQueueTransport
+    # has a local-unique address, along with a threading.Queue.  This
+    # common module hosts the multiprocess.Queue endpoint and
+    # demultiplexes incoming messages to the correct threading.Queue.
+
+    def __init__(self, myQueue, parentQ, adminQ, adminAddr, my_address):
+        super(MultiprocessQueueTCore_Actor, self).__init__(myQueue, parentQ,
+                                                           adminQ, adminAddr)
+        self._my_address = my_address
+
+    def isMyAddress(self, addr):
+        return addr == self._my_address
+
+    def core_transmit(self, transmitIntent):
+        return self.core_common_transmit(transmitIntent, self._myAddr)
+
+    def core_receive(self, inc_handler, run_time_f):
+        return self.core_common_receive(inc_handler, self._myAddr, run_time_f)
+
+
 class MultiprocessQueueTransport(asyncTransportBase, wakeupTransportBase):
     """A transport designed to use a multiprocess.Queue instance to send
        and receive messages with other multiprocess Process actors.
@@ -106,51 +423,54 @@ class MultiprocessQueueTransport(asyncTransportBase, wakeupTransportBase):
         if isinstance(initType, ExternalInterfaceTransportInit):
             # External process that's going to talk "in".  There is no
             # parent, and the child is the systemAdmin.
-            capabilities, logDefs = args
-            self._parentQ         = None
-            self._adminQ          = Queue(MAX_ADMIN_QUEUESIZE)
-            self._adminAddr       = self.getAdminAddr(capabilities)
-            self._myQAddress      = ActorAddress(QueueActorAddress('~'))
-            self._myInputQ        = Queue(MAX_ACTOR_QUEUESIZE)
+            capabilities, logDefs, self._concontext = args
+            NewQ = self._concontext.Queue if self._concontext else Queue
+            self._parentQ    = None
+            self._adminQ     = NewQ(MAX_ADMIN_QUEUESIZE)
+            self._adminAddr  = self.getAdminAddr(capabilities)
+            self._myQAddress = ActorAddress(QueueActorAddress('~'))
+            self._myInputQ   = NewQ(MAX_ACTOR_QUEUESIZE)
+            self._QCore = MultiprocessQueueTCore_Actor(self._myInputQ, None, self._adminQ, self._adminAddr, self._myQAddress)
         elif isinstance(initType, MpQTEndpoint):
-            _addrInst, myAddr, myQueue, parentQ, adminQ, adminAddr = initType.args
+            _addrInst, myAddr, myQueue, parentQ, adminQ, adminAddr, ccon = initType.args
+            self._concontext = ccon
             self._parentQ    = parentQ
             self._adminQ     = adminQ
             self._adminAddr  = adminAddr
             self._myQAddress = myAddr
-            self._myInputQ   = myQueue
+            #self._myInputQ   = myQueue
+            self._QCore = MultiprocessQueueTCore_Actor(myQueue, parentQ, adminQ, myAddr, myAddr)
+            # _aborting_run
+            # _checkChildren
+            # _shutdownSignalled
+        elif isinstance(initType, ExternalQTransportCopy):
+            # External process that's going to talk "in".  There is no
+            # parent, and the child is the systemAdmin.
+            cnum, self._adminQ, self._adminAddr, self._concontext, self._myInputQ, self._queues, self._fwdvia = args
+            #NewQ = self._concontext.Queue if self._concontext else Queue
+            self._parentQ    = None
+            self._myQAddress = ActorAddress(QueueActorAddress('~%d' % cnum))
+            #self._myInputQ   = NewQ(MAX_ACTOR_QUEUESIZE)
+            thesplog('CLONE %s is %s', self._myQAddress, self._myInputQ)
         else:
             thesplog('MultiprocessQueueTransport init of type %s unsupported!', str(initType),
                      level=logging.ERROR)
 
-        # _queues is a map of direct child ActorAddresses to Queue instance.  Note
-        # that there will be multiple keys mapping to the same Queue
-        # instance because routing is only either to the Parent or to
-        # an immediate Child.
-        self._queues = AssocList()  # addr -> queue
-
-        # _fwdvia represents routing for other than immediate parent
-        # or child (there may be multiple target addresses mapping to
-        # the same forward address.
-        self._fwdvia = AssocList()  # targetAddress -> fwdViaAddress
-
         self._nextSubInstance = 0
 
 
+    def close(self):
+        pass
+
+
     def protectedFileNumList(self):
-        return foldl(lambda a, b: a+[b._reader.fileno(), b._writer.fileno()],
-                     [self._myInputQ, self._parentQ, self._adminQ] +
-                     list(self._queues.values()), [])
+        return self._QCore.protectedFileNumList()
 
     def childResetFileNumList(self):
-        return foldl(lambda a, b: a+[b._reader.fileno(), b._writer.fileno()],
-                     [self._parentQ] +
-                     list(self._queues.values()), [])
-
+        return self._QCore.childResetFileNumList()
 
     @property
     def myAddress(self): return self._myQAddress
-
 
     @staticmethod
     def getAddressFromString(addrspec):
@@ -197,20 +517,29 @@ class MultiprocessQueueTransport(asyncTransportBase, wakeupTransportBase):
            communications after creation of the Child by calling
            connectEndpoint() with this returned object.
         """
+        NewQ = self._concontext.Queue if self._concontext else Queue
         if isinstance(assignedLocalAddr.addressDetails, ActorLocalAddress):
             return MpQTEndpoint(assignedLocalAddr.addressDetails.addressInstanceNum,
                                 self._nextSubAddress(),
-                                Queue(MAX_ACTOR_QUEUESIZE),
-                                self._myInputQ, self._adminQ, self._adminAddr)
+                                NewQ(MAX_ACTOR_QUEUESIZE),
+                                self._QCore.mainLocalInputQueueEndpoint(),
+                                self._QCore.adminQueueEndpoint(),
+                                self._QCore.adminAddr,
+                                self._concontext)
         return MpQTEndpoint(None,
                             assignedLocalAddr,
-                            self._adminQ, self._myInputQ, self._adminQ, self._adminAddr)
+                            self._QCore.adminQueueEndpoint(),
+                            self._QCore.mainLocalInputQueueEndpoint(),
+                            self._QCore.adminQueueEndpoint(),
+                            self._adminAddr,
+                            self._concontext)
 
     def connectEndpoint(self, endPoint):
         """Called by the Parent after creating the Child to fully connect the
            endpoint to the Child for ongoing communications."""
-        _addrInst, childAddr, childQueue, _myQ, _adminQ, _adminAddr = endPoint.args
-        self._queues.add(childAddr, childQueue)
+        (_addrInst, childAddr, childQueue, _myQ,
+         _adminQ, _adminAddr, _concurrency_context) = endPoint.args
+        self._QCore.add_endpoint(childAddr, childQueue)
 
 
     def deadAddress(self, addressManager, childAddr):
@@ -219,128 +548,19 @@ class MultiprocessQueueTransport(asyncTransportBase, wakeupTransportBase):
         # the addressManager is also aware of the dead address and
         # will cause DeadEnvelope forwarding.  Deleting here
         # prevents hanging on queue full to dead children.
-        self._queues.rmv(childAddr)
-        deadfwd, okfwd = ([],[]) if False else \
-                         partition(lambda i: i[0] == childAddr or i[1] == childAddr,
-                                   self._fwdvia.items())
-        if deadfwd:
-            self._fwdvia = AssocList()
-            for A,AQ in okfwd:
-                self._fwdvia.add(A,AQ)
+        thesplog('deadAddress %s', childAddr)
+        addressManager.deadAddress(childAddr)
+        self._QCore.set_address_to_dead(childAddr)
         super(MultiprocessQueueTransport, self).deadAddress(addressManager, childAddr)
 
 
     def _runWithExpiry(self, incomingHandler):
-        """Core scheduling method; called by the current Actor process when
-           idle to await new messages (or to do background
-           processing).
-        """
-        if incomingHandler == TransmitOnly or \
-           isinstance(incomingHandler, TransmitOnly):
-            # transmits are not queued/multistage in this transport, no waiting
-            return 0
-
-        self._aborting_run = False
-
-        while not self.run_time.expired() and not self._aborting_run:
-            try:
-                rcvd = self._myInputQ.get(True, self.run_time.remainingSeconds())
-            except Q.Empty:
-                # Probably a timeout, but let the while loop decide for sure
-                continue
-            relayAddr, (sendAddr, destAddr, msg) = rcvd
-            if not self._queues.find(sendAddr):
-                # We don't directly know about this sender, so
-                # remember what path this arrived on to know where to
-                # direct future messages for this sender.
-                if relayAddr and self._queues.find(relayAddr) and \
-                   not self._fwdvia.find(sendAddr):
-                    # relayAddr might be None if it's our parent, which is OK because
-                    # the default message forwarding is to the parent.  If it's not
-                    # none, it should be in self._queues though!
-                    self._fwdvia.add(sendAddr, relayAddr)
-            if hasattr(self, '_addressMgr'):
-                destAddr,msg = self._addressMgr.prepMessageSend(destAddr, msg)
-            if destAddr is None:
-                thesplog('Unexpected target inaccessibility for %s', msg,
-                         level = logging.WARNING)
-                raise CannotPickleAddress(destAddr)
-
-            if msg is SendStatus.DeadTarget:
-                thesplog('Faking message "sent" because target is dead and recursion avoided.')
-                continue
-
-            if destAddr == self._myQAddress:
-                if incomingHandler is None:
-                    return ReceiveEnvelope(sendAddr, msg)
-                if not incomingHandler(ReceiveEnvelope(sendAddr, msg)):
-                    return  # handler returned False, indicating run() should exit
-            else:
-                # Note: the following code has implicit knowledge of serialize() and xmit
-                putQValue = lambda relayer: (relayer, (sendAddr, destAddr, msg))
-                # Must forward this packet via a known forwarder or our parent.
-                tgtQ = self._queues.find(destAddr)
-                if tgtQ:
-                    tgtQ.put(putQValue(self.myAddress), True)
-                else:
-                    tgtA = self._fwdvia.find(destAddr)
-                    if tgtA:
-                        self._queues.find(tgtA).put(putQValue(None))
-                    else:
-                        # Not sure how to route this message yet.  It
-                        # could be a heretofore silent child of one of our
-                        # children, it could be our parent (whose address
-                        # we don't know), or it could be elsewhere in the
-                        # tree.
-                        #
-                        # Try sending it to the parent first.  If the
-                        # parent can't determine the routing, it will be
-                        # sent back down (relayAddr will be None in that
-                        # case) and it must be sprayed out to all children
-                        # in case the target lives somewhere beneath us.
-                        # Note that _parentQ will be None for top-level
-                        # actors, which send up to the Admin instead.
-                        #
-                        # As a special case, the external system is the
-                        # parent of the admin, but the admin is the
-                        # penultimate parent of all others, so this code
-                        # must keep the admin and the parent from playing
-                        # ping-pong with the message.  But... the message
-                        # might be directed to the external system, which
-                        # is the parent of the Admin, so we need to check
-                        # with it first.
-                        #   parentQ == None but adminQ good --> external
-                        #   parentQ and adminQ and myAddress == adminAddr --> Admin
-                        #   parentQ and adminQ and myAddress != adminADdr --> other Actor
-
-                        if relayAddr:
-                            # Send message up to the parent to see if the
-                            # parent knows how to forward it
-                            (self._parentQ or self._adminQ).put(putQValue(self.myAddress if self._parentQ else None), True)
-                        else:
-                            # Sent by parent or we are an external, so this
-                            # may be some grandchild not currently known.
-                            # Do the worst case and just send this message
-                            # to ALL immediate children, hoping it will
-                            # get there via some path.
-                            for A,AQ in self._queues.items():
-                                if A not in [self._adminAddr, str(self._adminAddr)]:
-                                    # None means sent by Parent, so don't
-                                    # send BACK to parent if unknown
-                                    AQ.put(putQValue(None), True)
-
-                            # fmap(lambda A,Q: A not in [self._adminAddr, str(self._adminAddr)]
-                            #                  # None means sent by Parent, so don't
-                            #                  # send BACK to parent if unknown
-                            #                  and Q.put(putQValue(None), True),
-                            #      self._queues)
-        return None
-
+        return self._QCore.core_receive(incomingHandler,
+                                        lambda s=self: s.run_time)
 
     def abort_run(self, drain=False):
         # Queue transmits immediately, so no draining needed
-        self._aborting_run = True
-
+        self._QCore.abort_core_run()
 
     def serializer(self, intent):
         wrappedMsg = self._myQAddress, intent.targetAddr, intent.message
@@ -356,17 +576,9 @@ class MultiprocessQueueTransport(asyncTransportBase, wakeupTransportBase):
         discard = pickle.dumps(wrappedMsg)
         return wrappedMsg
 
-    def _scheduleTransmitActual(self, transmitIntent):
-        if transmitIntent.targetAddr == self.myAddress:
-            self._myInputQ.put( (self._myQAddress, transmitIntent.serMsg), True)
-        else:
-            tgtQ = self._queues.find(transmitIntent.targetAddr)
-            if tgtQ:
-                tgtQ.put((self._myQAddress, transmitIntent.serMsg), True)
-            else:
-                # None means sent by parent, so don't send BACK to parent if unknown
-                topOrFromBelow = self._myQAddress if self._parentQ else None
-                (self._parentQ or self._adminQ).put((topOrFromBelow, transmitIntent.serMsg), True)
 
-        transmitIntent.result = SendStatus.Sent
-        transmitIntent.completionCallback()
+    def interrupt_wait(self, signal_shutdown=False, check_children=False):
+        self._QCore.interrupt_run(signal_shutdown, check_children)
+
+    def _scheduleTransmitActual(self, transmitIntent):
+        self._QCore.core_transmit(transmitIntent)

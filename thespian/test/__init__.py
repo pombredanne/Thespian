@@ -129,7 +129,7 @@ class ActorSystemTestCase(unittest.TestCase, LocallyManagedActorSystem):
 
 testAdminPort = None
 
-def get_free_admin_port():
+def get_free_admin_port_random():
     global testAdminPort
     if testAdminPort is None:
         import random
@@ -137,6 +137,25 @@ def get_free_admin_port():
     else:
         testAdminPort = testAdminPort + 1
     return testAdminPort
+
+def get_free_admin_port():
+    import socket
+    import random
+    for tries in range(100):
+        port = random.randint(5000, 60000)
+        try:
+            socket.socket(socket.AF_INET,
+                          socket.SOCK_STREAM,
+                          socket.IPPROTO_TCP).bind(('',port))\
+                  .close()
+            socket.socket(socket.AF_INET,
+                          socket.SOCK_DGRAM,
+                          socket.IPPROTO_UDP).bind(('',port))\
+                  .close()
+            return port
+        except Exception:
+            pass
+    return get_free_admin_port_random()
 
 
 @pytest.fixture(params=['simpleSystemBase',
@@ -154,6 +173,7 @@ def asys(request):
     if request.param.startswith('multiprocTCP') or \
        request.param.startswith('multiprocUDP'):
         caps['Admin Port'] = get_free_admin_port()
+        caps['Convention Address.IPv4'] = '', caps['Admin Port']
     if request.param.endswith('-AdminRouting'):
         caps['Admin Routing'] = True
     if request.param.endswith('-AdminRoutingTXOnly'):
@@ -251,8 +271,20 @@ def actor_system_unsupported(asys, *unsupported_bases):
         pytest.skip("Functionality not supported for %s system base"%asys.base_name)
 
 
-from thespian.system.utilis import timePeriodSeconds
+from thespian.system.timing import timePeriodSeconds
 import time
 
 inTestDelay = lambda period: time.sleep(timePeriodSeconds(period))
 
+
+def delay_for_next_of_kin_notification(system):
+    if system.base_name == 'multiprocQueueBase':
+        # The multiprocQueueBase signal processor cannot interrupt a
+        # sleeping Queue.get(), so for this base it is necessary to
+        # wait for the timeout on the Queue.get() to allow it time to
+        # notice and process the child exit.
+        time.sleep(2.5)
+    elif system.base_name == 'multiprocUDPBase':
+        time.sleep(0.6)
+    else:
+        time.sleep(0.1)

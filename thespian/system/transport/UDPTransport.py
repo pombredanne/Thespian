@@ -16,18 +16,26 @@ even between processes on separate systems.
 
 
 import logging
-from thespian.system.utilis import ExpiryTime, thesplog
+from thespian.system.utilis import thesplog
 from thespian.actors import *
 from thespian.system.transport import *
 from thespian.system.transport.IPBase import *
+from thespian.system.timing import ExpirationTimer
+from thespian.system.utilis import partition
+from thespian.system.messages.multiproc import ChildMayHaveDied
 from thespian.system.addressManager import ActorLocalAddress
 import socket
 import select
-from datetime import datetime
-#import json
-import pickle
+from datetime import timedelta
+try:
+    import cPickle as pickle
+except Exception:
+    import pickle
 from thespian.system.transport.asyncTransportBase import asyncTransportBase
 from thespian.system.transport.wakeupTransportBase import wakeupTransportBase
+
+
+DEAD_ADDRESS_TIMEOUT = timedelta(seconds=15)
 
 
 serializer = pickle
@@ -46,40 +54,55 @@ class UDPTransport(asyncTransportBase, wakeupTransportBase):
     def __init__(self, initType, *args):
         super(UDPTransport, self).__init__()
 
+        templateAddr = None
         if isinstance(initType, ExternalInterfaceTransportInit):
             # External process that is going to talk "in".  There is
             # no parent, and the child is the systemAdmin.
-            capabilities, logDefs = args
-            templateAddr          = UDPv4ActorAddress(None, 0)
-            self.socket           = socket.socket(*templateAddr.socketArgs)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind(*templateAddr.bindArgs)
-            self.myAddress        = ActorAddress(UDPv4ActorAddress(*self.socket.getsockname(),
-                                                                   external=True))
-            thesplog('external template %s got actual %s', templateAddr, self.myAddress,
-                     level=logging.DEBUG)
+            capabilities, logDefs, concurrency_context = args
             self._adminAddr       = self.getAdminAddr(capabilities)
             self._parentAddr      = None
         elif isinstance(initType, UDPEndpoint):
             instanceNum, assignedAddr, self._parentAddr, self._adminAddr = initType.args
-            templateAddr = assignedAddr or ActorAddress(UDPv4ActorAddress(None, 0))
-            self.socket           = socket.socket(*templateAddr.addressDetails.socketArgs)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind(*templateAddr.addressDetails.bindArgs)
+            templateAddr = assignedAddr
             # N.B.  myAddress is actually the address we will export
             # for others to talk to us, not the bind address.  The
             # difference is that we bind to '0.0.0.0' (inaddr_any),
             # but that's not a valid address for people to send stuff
             # to us.
-            self.myAddress = ActorAddress(UDPv4ActorAddress(*self.socket.getsockname(),
-                                                            external=True))
         else:
             thesplog('UDPTransport init of type %s unsupported', str(initType), level=logging.ERROR)
+        if not templateAddr:
+            templateAddr = ActorAddress(UDPv4ActorAddress(None, 0))
+        self.socket = socket.socket(*templateAddr.addressDetails.socketArgs)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(*templateAddr.addressDetails.bindArgs)
+        self.myAddress = ActorAddress(UDPv4ActorAddress(*self.socket.getsockname(),
+                                                        external=True))
         self._rcvd = []
+        self._checkChildren = False
+        self._shutdownSignalled = False
+        self._pending_actions = [] # array of (ExpirationTimer, func)
+
+
+    def close(self):
+        """Releases all resources and terminates functionality.  This is
+           better done deterministically by explicitly calling this
+           method (although __del__ will attempt to perform similar
+           operations), but it has the unfortunate side-effect of
+           making this object modal: after the close it can be
+           referenced but not successfully used anymore, so it
+           explicitly nullifies its contents.
+        """
+        if hasattr(self, '_pending_actions'):
+            delattr(self, '_pending_actions')
+        if hasattr(self, 'socket'):
+            self.socket.close()
+            delattr(self, 'socket')
 
 
     def protectedFileNumList(self):
         return [self.socket.fileno()]
+
 
     def childResetFileNumList(self):
         return self.protectedFileNumList()
@@ -163,36 +186,53 @@ class UDPTransport(asyncTransportBase, wakeupTransportBase):
 
     def connectEndpoint(self, endPoint):
         pass
-        #KWQ: need to verify child is started here (message to host) so that the next step (ThespianStatusReq)?  But this would block the parent here waiting for the child when there's other work to be done.  Really want to handle this via run waiting for a natural response from the child.  Similar to MultiProcAdmin handling of h_EndpointConnected?  NEed to do that similar thing in systemBase?
 
-            # sresp, _ign1, _ign2 = select.select([self.socket.fileno()], [], [],
-            #                                     None if time_to_quit is None else
-            #                                     timePeriodSeconds(time_to_quit -
-            #                                                       datetime.now()))
-        # KWQ: not actually connected? waiting for child to callback and confirm?  happens automatically?  need this method really?
+
+    def deadAddress(self, addressManager, childAddr):
+        # UDP is unable to indicate whether the target address is
+        # still alive or not, so this entry point is unlikely to be
+        # utilized.  In addition, UDP can use recycled ports, so the
+        # hopeful workaround here is to mark the address as dead for a
+        # period of time and hope that the port is not recycled by the
+        # system in that time frame.
+        addressManager.deadAddress(childAddr)
+        self._pending_actions.append( (ExpirationTimer(DEAD_ADDRESS_TIMEOUT),
+                                       lambda am=addressManager, addr=childAddr:
+                                       addressManager.remove_dead_address(addr)))
+        super(UDPTransport, self).deadAddress(addressManager, childAddr)
 
 
     def serializer(self, intent):
         return serializer.dumps(intent.message)
 
+
+    def interrupt_wait(self,
+                       signal_shutdown=False,
+                       check_children=False):
+        self._shutdownSignalled |= signal_shutdown
+        self._checkChildren |= check_children
+        # Under some python implementations, signal handling (which
+        # could generate an ActorShutdownRequest) can be performed
+        # without interrupting the underlying syscall, so this message
+        # is otherwise ignored but causes the select.select below to
+        # return.
+        self.socket.sendto(b'BuMP', self.myAddress.addressDetails.sockname)
+
+
     def _scheduleTransmitActual(self, transmitIntent):
         if transmitIntent.targetAddr == self.myAddress:
             self._rcvd.append(ReceiveEnvelope(transmitIntent.targetAddr,
                                               transmitIntent.message))
-            # Under some python implementations, signal handling
-            # (which could generate an ActorShutdownRequest) can be
-            # performed without interrupting the underlying syscall,
-            # so this message is otherwise ignored but causes the
-            # select.select below to return.
-            r = self.socket.sendto(b'BuMP', transmitIntent.targetAddr.addressDetails.sockname)
+            self.interrupt_wait()
             r = True
         else:
             # UDPTransport transmit is serially blocking, but both sender
             # and receiver provide lots of buffering.  At present, there
             # is no receipt confirmation (KWQ: but there should be)
             r = self.socket.sendto(transmitIntent.serMsg, transmitIntent.targetAddr.addressDetails.sockname)
-        transmitIntent.result = SendStatus.Sent if r else SendStatus.BadPacket
-        transmitIntent.completionCallback()
+        transmitIntent.tx_done(SendStatus.Sent
+                               if r else
+                               SendStatus.BadPacket)
 
 
     def _runWithExpiry(self, incomingHandler):
@@ -207,14 +247,20 @@ class UDPTransport(asyncTransportBase, wakeupTransportBase):
             if self._rcvd:
                 rcvdEnv = self._rcvd.pop()
             else:
+                next_action_timeout = self.check_pending_actions()
                 try:
                     sresp, _ign1, _ign2 = select.select([self.socket.fileno()], [], [],
-                                                        self.run_time.remainingSeconds())
+                                                        min(self.run_time, next_action_timeout)
+                                                        .remainingSeconds())
                 except select.error as se:
                     import errno
                     if se.args[0] != errno.EINTR:
                         thesplog('Error during select: %s', se)
                         return None
+                    continue
+                except ValueError:
+                    # self.run_time can expire between the while test
+                    # and the use in the select statement.
                     continue
 
                 if [] == sresp:
@@ -225,20 +271,37 @@ class UDPTransport(asyncTransportBase, wakeupTransportBase):
                     continue
                 rawmsg, sender = self.socket.recvfrom(65535)
                 if rawmsg == b'BuMP':
-                    continue
-                sendAddr = ActorAddress(UDPv4ActorAddress(*sender, external=True))
-                try:
-                    msg = serializer.loads(rawmsg)
-                except Exception as ex:
-                    continue
+                    sendAddr = self.myAddress
+                    if self._checkChildren:
+                        self._checkChildren = False
+                        msg = ChildMayHaveDied()
+                    elif self._shutdownSignalled:
+                        self._shutdownSignalled = False
+                        msg = ActorExitRequest()
+                    else:
+                        return Thespian__UpdateWork()
+                else:
+                    sendAddr = ActorAddress(UDPv4ActorAddress(*sender, external=True))
+                    try:
+                        msg = serializer.loads(rawmsg)
+                    except Exception:
+                        continue
                 rcvdEnv = ReceiveEnvelope(sendAddr, msg)
             if incomingHandler is None:
                 return rcvdEnv
-            if not incomingHandler(rcvdEnv):
-                return  # handler returned False, indicating run() should exit
+            r = incomingHandler(rcvdEnv)
+            if not r:
+                return r # handler returned False, indicating run() should exit
 
         return None
 
+    def check_pending_actions(self):
+        expired, remaining = partition(lambda E: E[0].expired(),
+                                       self._pending_actions)
+        for each in expired:
+            each[1]()
+        self._pending_actions = remaining
+        return min([E[0] for E in self._pending_actions] + [ExpirationTimer(None)])
 
     def abort_run(self, drain=False):
         """Indicates that run should exit; similar to a handler returning

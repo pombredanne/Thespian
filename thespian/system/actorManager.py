@@ -14,20 +14,20 @@ from thespian.system.messages.status import Thespian_StatusReq, Thespian_ActorSt
 from thespian.system.messages import *
 from thespian.system.messages.convention import NotifyOnSystemRegistration
 from thespian.system.messages.logcontrol import SetLogging
-from thespian.system.utilis import ExpiryTime, actualActorClass
+from thespian.system.utilis import actualActorClass
+from thespian.system.timing import ExpiryTime
 from thespian.system.sourceLoader import loadModuleFromHashSource
 from datetime import timedelta
 from functools import partial
 
 
-MAX_SHUTDOWN_DRAIN_PERIOD=timedelta(seconds=7)
-
-
 class ActorManager(systemCommonBase):
     def __init__(self, childClass, transport, sourceHash, sourceToLoad,
                  parentAddr, adminAddr,
-                 childRequirements, currentSystemCapabilities):
+                 childRequirements, currentSystemCapabilities,
+                 concurrency_context):
         super(ActorManager, self).__init__(adminAddr, transport)
+        self.init_replicator(transport, concurrency_context)
         self._parentAddr = parentAddr
         self._sourceHash = sourceHash
         self._sources    = { sourceHash: sourceToLoad }
@@ -64,7 +64,7 @@ class ActorManager(systemCommonBase):
                           exc_info = True)
             thesplog('Actor %s @ %s instantiation exception: %s', self._actorClass,
                      self.transport.myAddress, traceback.format_exc(),
-                     level=logging.ERROR, primary=True)
+                     level=logging.WARNING, primary=True)
             self._sCBStats.inc('Actor.Instance Create Failed')
             self._sayGoodbye()
             return
@@ -77,10 +77,17 @@ class ActorManager(systemCommonBase):
         if self.actorInst is None: self._createInstance()
         if self.actorInst:
             try:
-                self.transport.run(self.handleMessages)
-                # Expects that on completion of self.transport.run
-                # that the Actor is done processing and that it has
-                # been shutdown gracefully.
+                while True:
+                    r = self.transport.run(self.handleMessages)
+                    if isinstance(r, Thespian__UpdateWork):
+                        self._send_intent(
+                            TransmitIntent(self.myAddress, r))  # tickle the transmit queues
+                        continue
+                    # Expects that on completion of self.transport.run
+                    # that the Actor is done processing and that it has
+                    # been shutdown gracefully.
+                    self.drainTransmits()
+                    break
             except Exception as ex:
                 # This is usually an internal problem, since the
                 # request handling itself catches any exceptions from
@@ -95,13 +102,6 @@ class ActorManager(systemCommonBase):
         else:
             self.drainTransmits()
         thesplog('Run %s done', self._actorClass, level=logging.DEBUG)
-
-
-    def drainTransmits(self):
-        drainLimit = ExpiryTime(MAX_SHUTDOWN_DRAIN_PERIOD)
-        while not drainLimit.expired():
-            if not self.transport.run(TransmitOnly, drainLimit.remaining()):
-                break  # no transmits left
 
 
     def handleMessages(self, envelope):
@@ -169,21 +169,20 @@ class ActorManager(systemCommonBase):
                         self._sCBStats.inc('Actor.Message Received.Caused Secondary Exception')
                         thesplog('Actor %s @ %s second exception on message %s: %s',
                                  self._actorClass, self.transport.myAddress, msg,
-                                 traceback.format_exc(),
-                                 level = logging.ERROR)
+                                 traceback.format_exc())
                         logging.getLogger(str(self._actorClass)) \
                                .error('Actor %s @ %s second exception on message %s',
                                       self._actorClass, self.transport.myAddress, msg,
                                       exc_info = True)
                         if not isinstance(msg, PoisonMessage):
                             self._send_intent(
-                                TransmitIntent(envelope.sender, PoisonMessage(msg)))
+                                TransmitIntent(
+                                    envelope.sender,
+                                    PoisonMessage(msg,
+                                                  traceback.format_exc())))
 
 
         if isinstance(msg, ActorExitRequest):
-            if getattr(self, '_exiting', None) is not None:
-                return True  # multiple shutdown requests ignored
-            # Initiate exit; may be a delay while children are shutdown
             return self._actorExit(msg)
 
         if hasattr(self.transport, 'set_watch'):
@@ -209,7 +208,7 @@ class ActorManager(systemCommonBase):
         if hasattr(atexit, 'unregister'):
             atexit.unregister(self._shutdownActor)
         if getattr(self, '_exiting', None):
-            return  # already exiting
+            return True  # already exiting
         self._exiting = True  # set exiting mode
 
         children = self.childAddresses
@@ -227,16 +226,21 @@ class ActorManager(systemCommonBase):
             return True  # keep going
         # Don't need to wait for children, so exit as soon as transmit pipe drains.
         self.transport.abort_run(drain=True)
-        return True
+        return False
 
 
     def _sayGoodbye(self):
         self._send_intent(
-            TransmitIntent(self._parentAddr, ChildActorExited(self.transport.myAddress)))
+            TransmitIntent(self._adminAddr,
+                           NotifyOnSourceAvailability(self.transport.myAddress,
+                                                      False)))
+        self._send_intent(
+            TransmitIntent(self._parentAddr,
+                           ChildActorExited(self.transport.myAddress)))
 
 
     def _childInaccessible(self, childAddress, exitRequestIntent):
-        self._handleChildExited(childAddress)
+        return self._handleChildExited(childAddress)
 
 
     def checkNewCapabilities(self, envelope):
@@ -258,7 +262,19 @@ class ActorManager(systemCommonBase):
 
     def actor_send(self, targetAddr, msg):
         self._sCBStats.inc('Actor.Message Send.Generated')
-        self._send_intent(TransmitIntent(targetAddr, msg))
+        self._send_intent(TransmitIntent(targetAddr, msg,
+                                         onError=self.actor_send_fail))
+
+    def actor_send_fail(self, result, intent):
+        # If this was a DeadTarget failure, forward to the Admin for
+        # dead letter handling (with appropriate avoiding of recursion
+        # loops; see also addressManager.py:prepMessageSend).
+        if result == SendStatus.DeadTarget and \
+           intent.targetAddr != self._adminAddr and \
+           not isinstance(intent.message, (DeadEnvelope, ChildActorExited)):
+            self._send_intent(TransmitIntent(self._adminAddr,
+                                             DeadEnvelope(intent.targetAddr,
+                                                          intent.message)))
 
 
     # ----------------------------------------------------------------------
@@ -304,9 +320,7 @@ class ActorManager(systemCommonBase):
                                                   actualAddress)
         if isMyChild: self._registerChild(actualAddress)
 
-        # Send any queued transmits for this child, and move the
-        # finalTransmit marker to use the new address.
-
+        # Send any queued transmits for this child.
         self._retryPendingChildOperations(childInstance, actualAddress)
 
 
@@ -314,7 +328,7 @@ class ActorManager(systemCommonBase):
         # Have seen it arrive here without errorCode set on the PendingActorResponse...
         if not hasattr(envelope.message, 'errorCode'):
             thesplog('Corrupted Pending Actor Response?: %s (%s)',
-                     envelope.message, dir(envelope.message), level = logging.ERROR)
+                     envelope.message, dir(envelope.message), level=logging.ERROR)
             return True
         if not getattr(envelope.message, 'errorCode', 'Failed'):
             self._pendingActorReady(envelope.message.instanceNum,
@@ -322,13 +336,16 @@ class ActorManager(systemCommonBase):
                                     isMyChild = not envelope.message.globalName)
             return True
         # Pending Actor Creation failed, clean up all the stuff associated with the intended Actor
-        thesplog('Pending Actor create failed (%s): %s',
+        thesplog('Pending Actor create for %s failed (%s): %s',
+                 envelope.message.forActor,
                  getattr(envelope.message, 'errorCode', '??'),
                  getattr(envelope.message, 'errorStr', '---'))
         logging.getLogger(str(self._actorClass)) \
-               .error('Pending Actor create failed (%s): %s',
+               .error('Pending Actor create for %s failed (%s): %s',
+                      envelope.message.forActor,
                       getattr(envelope.message, 'errorCode', '??'),
                       getattr(envelope.message, 'errorStr', '---'))
+        # Cancel any queued transmits for this child.
         self._retryPendingChildOperations(envelope.message.instanceNum, None)
         return True
 
@@ -338,7 +355,8 @@ class ActorManager(systemCommonBase):
                                     self._actorClass,
                                     self._adminAddr,
                                     self._parentAddr,
-                                    self._sourceHash)
+                                    self._sourceHash,
+                                    getattr(self, '_exiting', None))
         self._updateStatusResponse(resp)
         return resp
 
@@ -389,14 +407,25 @@ class ActorManager(systemCommonBase):
             TransmitIntent(self._adminAddr, RegisterSourceAuthority(address)))
 
 
+    def notifyOnSourceAvailability(self, watcherAddress, enable):
+        self._send_intent(
+            TransmitIntent(self._adminAddr,
+                           NotifyOnSourceAvailability(watcherAddress, enable)))
+
+
     def loadActorSource(self, fname):
         f = fname if hasattr(fname, 'read') else open(fname, 'rb')
         try:
             d = f.read()
             import hashlib
             hval = hashlib.md5(d).hexdigest()
-            self._send_intent(TransmitIntent(self._adminAddr,
-                                             ValidateSource(hval, d)))
+            self._send_intent(
+                TransmitIntent(self._adminAddr,
+                               ValidateSource(hval, d,
+                                              getattr(f, 'name',
+                                                      str(fname)
+                                                      if hasattr(fname, 'read')
+                                                      else fname))))
             return hval
         finally:
             f.close()
@@ -417,19 +446,25 @@ class ActorManager(systemCommonBase):
     # Actors that involve themselves in topology
 
     def preRegisterRemoteSystem(self, remoteAddress, remoteCapabilities):
-        # how do we synthesize the remote Address?  via the capabilities?
         from thespian.system.messages.convention import ConventionRegister
         self._send_intent(
-            TransmitIntent(self._adminAddr,
-                           ConventionRegister(
-                               self.transport.getAddressFromString(remoteAddress),
-                               remoteCapabilities,
-                               preRegister=True)))
+            TransmitIntent(
+                self._adminAddr,
+                ConventionRegister(
+                    self.transport.getAddressFromString(remoteAddress),
+                    remoteCapabilities,
+                    preRegister=True)))
 
     def deRegisterRemoteSystem(self, remoteAddress):
         from thespian.system.messages.convention import ConventionDeRegister
         self._send_intent(
             TransmitIntent(self._adminAddr,
                            ConventionDeRegister(
+                               remoteAddress
+                               if isinstance(remoteAddress, ActorAddress) else
                                self.transport.getAddressFromString(remoteAddress),
                                preRegistered=True)))
+
+
+    def actorSystemShutdown(self):
+        self._send_intent(TransmitIntent(self._adminAddr, SystemShutdown()))

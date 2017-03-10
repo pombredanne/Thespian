@@ -10,10 +10,10 @@ from datetime import timedelta
 from pytest import raises, mark
 from thespian.system.utilis import thesplog
 
-
-sourceauthority_reg_wait = lambda: inTestDelay(timedelta(milliseconds=10))
-sourceload_wait = lambda: inTestDelay(timedelta(milliseconds=100))
+sourceauthority_reg_wait = lambda: inTestDelay(timedelta(milliseconds=100))
+sourceload_wait = lambda: inTestDelay(timedelta(milliseconds=300))
 sourceunload_wait = lambda: inTestDelay(timedelta(milliseconds=200))
+ask_wait = timedelta(seconds=15)
 
 
 def _encryptROT13Zipfile(zipFname):
@@ -259,6 +259,13 @@ def jormungandr(): return 'dragon'
 
 lizardSource = '''
 # Direct attempts to access the import machinery, a la sqlalchemy
+
+"This is a module docstring"
+
+
+from __future__ import with_statement
+
+from __future__ import print_function
 import sys
 py3k = sys.version_info >= (3,0)
 if py3k:
@@ -294,6 +301,36 @@ class SimpleSourceAuthority(ActorTypeDispatcher):
     def receiveMsg_ValidateSource(self, msg, sender):
         self.send(sender, ValidatedSource(msg.sourceHash, msg.sourceData))
 
+
+class LoadWatcher(ActorTypeDispatcher):
+    def receiveMsg_str(self, msg, sender):
+        if msg == 'go':
+            self.sources_yes = []
+            self.sources_no = []
+            self.notifyOnSourceAvailability(True)
+        elif msg == 'stop':
+            self.notifyOnSourceAvailability(False)
+        elif msg == 'what is loaded?':
+            self.send(sender, ', '.join(['%s=Yes'%H for H in self.sources_yes] +
+                                        ['%s=No'%H for H in self.sources_no]))
+    def receiveMsg_LoadedSource(self, loadmsg, sender):
+        self.sources_no = list(filter(lambda h: h != loadmsg.sourceHash,
+                                      self.sources_no))
+        # Allow multiple "loads" to show multiple times
+        self.sources_yes.append(loadmsg.sourceHash)
+        # n.b. the print validates the presence but not the value of
+        # loadmsg.sourceInfo
+        print('Notification of load of %s (%s)' % (loadmsg.sourceHash,
+                                                   loadmsg.sourceInfo))
+    def receiveMsg_UnloadedSource(self, unloadmsg, sender):
+        self.sources_yes = list(filter(lambda h: h != unloadmsg.sourceHash,
+                                      self.sources_yes))
+        # Allow multiple unloads to show multiple times
+        self.sources_no.append(unloadmsg.sourceHash)
+        # n.b. the print validates the presence but not the value of
+        # loadmsg.sourceInfo
+        print('Notification of unload of %s (%s)' % (unloadmsg.sourceHash,
+                                                     unloadmsg.sourceInfo))
 
 @pytest.fixture(scope='class')
 def source_zips(request):
@@ -492,6 +529,12 @@ class TestFuncLoadSource(object):
         asys.tell(asys.createActor(SimpleSourceAuthority), 'go')
         sourceauthority_reg_wait() # wait for source authorities to register
 
+    def _registerLoadNotifications(self, asys):
+        watcher = asys.createActor(LoadWatcher)
+        asys.tell(watcher, 'go')
+        sourceauthority_reg_wait() # wait for start and registration of load watcher
+        return watcher
+
     def test00_systemsRunnable(self, asys):
         pass
 
@@ -499,7 +542,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         raises(ImportError, asys.createActor, 'foo.FooActor')
         bar = asys.createActor('thespian.test.test_sourceLoading.BarActor')
-        assert 'SAW: hello' == asys.ask(bar, 'hello', 1)
+        r = asys.ask(bar, 'hello', ask_wait)
+        assert 'SAW: hello' == r
 
     def test01_verifyFooActorNotAvailableWithBogusSourceHash(self, asys):
         self._registerSA(asys)
@@ -525,7 +569,60 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
+    def _verifyHashNotification(self, asys, loadnotify, srchash, loaded=True):
+        srchash_loaded = '%s=%s' % (srchash, 'Yes' if loaded else 'No')
+        for tries in range(5):
+            r = asys.ask(loadnotify, 'what is loaded?', ask_wait)
+            print(srchash,'loaded:',r)
+            if r and srchash_loaded in r:
+                break
+            time.sleep(0.005)
+        else:
+            assert 'No source load notification of %s' % srchash == r
+        x = r.find(srchash_loaded)
+        # Verify only one load notification was received
+        assert -1 == r[x+len(srchash_loaded):].find(srchash_loaded)
+
+    def test02_verifyNotificationNotAvailableOnActorSystemItself(self, asys):
+        assert not hasattr(asys, 'notifyOnSourceAvailability')
+
+    def test02_verifyNotificationAndMainActorCreateWhenLoaded(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash = self._loadFooSource(asys, source_zips)
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
+    def test02_verifyNotificationMultipleAndMainActorCreateWhenLoaded(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash = self._loadFooSource(asys, source_zips)
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        loadnotify2 = self._registerLoadNotifications(asys)
+        self._verifyHashNotification(asys, loadnotify2, srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
+    def test02_verifyNotificationOfLoadedOnRegistration(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        srchash = self._loadFooSource(asys, source_zips)
+        loadnotify = self._registerLoadNotifications(asys)
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
 
     def test02_verifyNoSourceAuthorityIgnoresLoad(self, asys, source_zips):
         thesplog('tt2 %s', asys.port_num)
@@ -533,14 +630,77 @@ class TestFuncLoadSource(object):
         srchash = self._loadFooSource(asys, source_zips)
         raises(InvalidActorSourceHash, asys.createActor, 'foo.FooActor', sourceHash=srchash)
 
+    def test02_verifyNotificationNotSentWithNoSourceAuthority(self, asys, source_zips):
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash = self._loadFooSource(asys, source_zips)
+        r = asys.ask(loadnotify, 'what is loaded?', ask_wait)
+        assert r == ''
+
+
+    def test02_verifyNotificationStopDoesNotNotify(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        asys.tell(loadnotify, 'stop')
+        sourceload_wait()
+        srchash = self._loadFooSource(asys, source_zips)
+        sourceload_wait()
+        srchash_loaded = '%s=Yes' % srchash
+        for tries in range(3):
+            r = asys.ask(loadnotify, 'what is loaded?', ask_wait)
+            print(srchash,'loaded:',r)
+            assert srchash_loaded not in r
+            time.sleep(0.005)
+        # No notification, but srchash still useable
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
+    def test02_verifyNotificationKillDoesNotBreakNotify(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        asys.tell(loadnotify, ActorExitRequest())
+        sourceload_wait()
+        srchash = self._loadFooSource(asys, source_zips)
+        sourceload_wait()
+        r = asys.ask(loadnotify, 'what is loaded?', timedelta(milliseconds=300))
+        assert r is None
+        # No notification, but srchash still useable
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
+    def test02_verifyNotificationOfMultipleKillOneDoesNotBreakNotify(self, asys, source_zips):
+        thesplog('tt1 %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify1 = self._registerLoadNotifications(asys)
+        loadnotify2 = self._registerLoadNotifications(asys)
+        asys.tell(loadnotify1, ActorExitRequest())
+        sourceload_wait()
+        srchash = self._loadFooSource(asys, source_zips)
+        sourceload_wait()
+        r = asys.ask(loadnotify1, 'what is loaded?', timedelta(milliseconds=300))
+        assert r is None
+        self._verifyHashNotification(asys, loadnotify2, srchash)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+
     def test02_verifySubActorAvailableWhenLoaded(self, asys, source_zips):
         thesplog('tt3 %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
     def test02_verifySubModuleAvailableWhenLoaded(self, asys, source_zips):
         thesplog('tt4 %s', asys.port_num)
@@ -548,7 +708,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         cow = asys.createActor('barn.cow.moo.MooActor', sourceHash=srchash)
-        assert 'Moo: got milk' == asys.ask(cow, 'got milk', 1)
+        r = asys.ask(cow, 'got milk', ask_wait)
+        assert 'Moo: got milk' == r
 
     def test02_verifyAllAbsoluteImportPossibilities(self, asys, source_zips):
         thesplog('tt5 %s', asys.port_num)
@@ -556,7 +717,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         pig = asys.createActor('barn.pig.PigActor', sourceHash=srchash)
-        assert 'Oink Cluck Honk ready? Moooo' == asys.ask(pig, 'ready?', 1)
+        r = asys.ask(pig, 'ready?', ask_wait)
+        assert 'Oink Cluck Honk ready? Moooo' == r
 
     def test02_verifyBuiltinImport(self, asys, source_zips):
         actor_system_unsupported(asys, 'simpleSystemBase')
@@ -566,7 +728,8 @@ class TestFuncLoadSource(object):
         srchash = self._loadFooSource(asys, source_zips)
         sourceload_wait() # allow time for validation of source by source authority
         lizard = asys.createActor('lizard.Lizard', sourceHash=srchash)
-        assert 'Slimy goo' == asys.ask(lizard, 'goo', 1)
+        r = asys.ask(lizard, 'goo', ask_wait)
+        assert 'Slimy goo' == r
 
     def test02_verifyAllRelativeImportPossibilities(self, asys, source_zips):
         thesplog('tt6 %s', asys.port_num)
@@ -574,7 +737,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         sow = asys.createActor('barn.sow.SowActor', sourceHash=srchash)
-        assert 'Moooo Oink Cluck Honk ready?' == asys.ask(sow, 'ready?', 1)
+        r = asys.ask(sow, 'ready?', ask_wait)
+        assert 'Moooo Oink Cluck Honk ready?' == r
 
     @mark.skipif("sys.version_info >= (3,0)", reason="Python 2 version imports")
     def test02_verifyAllOLDSTYLERelativeImportPossibilities(self, asys, source_zips):
@@ -583,7 +747,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         piglet = asys.createActor('barn.piglet.PigletActor', sourceHash=srchash)
-        assert 'Moooo Oink Cluck Honk ready?' == asys.ask(piglet, 'ready?', 1)
+        r = asys.ask(piglet, 'ready?', ask_wait)
+        assert 'Moooo Oink Cluck Honk ready?' == r
 
     def test02_verifyDeepImportReferences(self, asys, source_zips):
         thesplog('tt8 %s', asys.port_num)
@@ -591,7 +756,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         roo = asys.createActor('roo.RooActor', sourceHash=srchash)
-        assert 'roo says whatever' == asys.ask(roo, 'roo says', 1)
+        r = asys.ask(roo, 'roo says', ask_wait)
+        assert 'roo says whatever' == r
 
     def test02_verifyHashSourceAvailablePostLoadFromMembers(self, asys, source_zips):
         thesplog('tt9 %s', asys.port_num)
@@ -599,10 +765,12 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
         # Cause a load-on-demand of a new module (in the loaded
         # sources) from the loaded sources themselves and ensure it's still available.
-        assert 'COW: Moooo on 1' == asys.ask(foo, 1)
+        r = asys.ask(foo, 1, ask_wait)
+        assert 'COW: Moooo on 1' == r
 
     def test02_verifyHashSourceNotInGlobalNamespace(self, asys, source_zips):
         thesplog('tta %s', asys.port_num)
@@ -610,7 +778,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
         # Verify loaded source is not accessible globally
         try:
             from bar.cow.moo import cow_says
@@ -656,8 +825,10 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
 
         # Update the foo sources
         foo2zipFname = os.path.join(tmpdir, 'foo2src.zip')
@@ -678,13 +849,19 @@ class TestFuncLoadSource(object):
         sourceload_wait() # allow time for validation of source by source authority
 
         foo2 = asys.createActor('foo.FooActor', sourceHash=srchash2)
-        assert 'TOG: good one' == asys.ask(foo2, 'good one', 1)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert '& MOO: great' == asys.ask(foo2, ('discard', 'great'), 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo2, 'good one', ask_wait)
+        assert 'TOG: good one' == r
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo2, ('discard', 'great'), ask_wait)
+        assert '& MOO: great' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
-        assert 'COW: Moooo on 1' == asys.ask(foo, 1, 1)
-        assert 'COW: Moooo on 1' == asys.ask(foo2, 1, 1)
+        r = asys.ask(foo, 1, ask_wait)
+        assert 'COW: Moooo on 1' == r
+        r = asys.ask(foo2, 1, ask_wait)
+        assert 'COW: Moooo on 1' == r
 
     def test04_verifyMultipleSeparateModulesLoaded(self, asys, source_zips):
         thesplog('ttf %s', asys.port_num)
@@ -696,9 +873,52 @@ class TestFuncLoadSource(object):
         sourceload_wait() # allow time for validation of source by source authority
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
         dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
-        assert 'Woof! bark' == asys.ask(dog, 'bark', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
+        r = asys.ask(dog, 'bark', ask_wait)
+        assert 'Woof! bark' == r
+
+    def test04_verifyNotificationOfMultipleSeparateModulesLoaded(self, asys, source_zips):
+        thesplog('ttf %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash2 = asys.loadActorSource(dogzipFname)
+        srchash = self._loadFooSource(asys, source_zips)
+        assert srchash2 is not None
+        sourceload_wait() # allow time for validation of source by source authority
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        self._verifyHashNotification(asys, loadnotify, srchash2)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
+        r = asys.ask(dog, 'bark', ask_wait)
+        assert 'Woof! bark' == r
+
+    def test04_verifyNotificationOfMultipleSeparateModulesLoadedPreAndPostRegistration(self, asys, source_zips):
+        thesplog('ttf %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash2 = asys.loadActorSource(dogzipFname)
+        assert srchash2 is not None
+        self._verifyHashNotification(asys, loadnotify, srchash2)
+        srchash = self._loadFooSource(asys, source_zips)
+        sourceload_wait() # allow time for validation of source by source authority
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        foo = asys.createActor('foo.FooActor', sourceHash=srchash)
+        dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
+        r = asys.ask(dog, 'bark', ask_wait)
+        assert 'Woof! bark' == r
 
     def test04_verifyMultipleSeparateModulesRequireCorrectSourceHashOnCreate(self, asys, source_zips):
         thesplog('ttg %s', asys.port_num)
@@ -711,7 +931,8 @@ class TestFuncLoadSource(object):
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
         raises(ImportError, asys.createActor,
                'dog.DogActor', sourceHash=srchash)  # wrong source hash
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
 
     def test05_verifyUnloadOfHashedSourcePreventsActorCreation(self, asys, source_zips):
         thesplog('tth %s', asys.port_num)
@@ -719,8 +940,10 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
         # Unload fooSource
         asys.unloadActorSource(srchash)
         sourceload_wait() # allow time for source unload
@@ -740,11 +963,38 @@ class TestFuncLoadSource(object):
         # Create an actor from that loaded source
         dogActor = asys.createActor('dog.DogActor', sourceHash = srchash)
         # Verify that actor can be used
-        assert asys.ask(dogActor, 'tick', 1) == 'Woof! tick'
+        r = asys.ask(dogActor, 'tick', ask_wait)
+        assert r == 'Woof! tick'
         # Now ask that actor to load and use a different source
         r = asys.ask(dogActor, [foozipFname, 'barn.cow.moo.MooActor', 'tock'],
                      5)
         assert r == 'And MOO: Bark! tock'
+
+
+    def test04_verifyNotificationOfMultipleSeparateModulesUnLoaded(self, asys, source_zips):
+        thesplog('ttf %s', asys.port_num)
+        tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
+        self._registerSA(asys)
+        loadnotify = self._registerLoadNotifications(asys)
+        srchash2 = asys.loadActorSource(dogzipFname)
+        assert srchash2 is not None
+        self._verifyHashNotification(asys, loadnotify, srchash2)
+        srchash = self._loadFooSource(asys, source_zips)
+        sourceload_wait() # allow time for validation of source by source authority
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        asys.unloadActorSource(srchash2)
+        self._verifyHashNotification(asys, loadnotify, srchash2, False)
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        srchash3 = asys.loadActorSource(dogzipFname)
+        # n.b. srchash2 and srchash3 are probably equal, so cannot verify srchash2
+        self._verifyHashNotification(asys, loadnotify, srchash)
+        self._verifyHashNotification(asys, loadnotify, srchash3)
+        asys.unloadActorSource(srchash)
+        self._verifyHashNotification(asys, loadnotify, srchash, False)
+        self._verifyHashNotification(asys, loadnotify, srchash3)
+        asys.unloadActorSource(srchash3)
+        self._verifyHashNotification(asys, loadnotify, srchash, False)
+        self._verifyHashNotification(asys, loadnotify, srchash3, False)
 
 
     def test04_circular_import_references(self, asys, source_zips):
@@ -753,7 +1003,8 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         serpent = asys.createActor('ouroboros.Serpent', sourceHash=srchash)
-        assert '<<endless-^-v-dragon>>' == asys.ask(serpent, '-^-v-', 1)
+        r = asys.ask(serpent, '-^-v-', ask_wait)
+        assert '<<endless-^-v-dragon>>' == r
 
 
     def test05_verifyUnloadOfHashedSourceDoesNotKillActiveActors(self, asys, source_zips):
@@ -762,13 +1013,17 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 12.1, round(asys.ask(foo, 8.3, 1) == 2)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 8.3, ask_wait)
+        assert 12.1 == round(r, 2)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
         # Unload fooSource
         asys.unloadActorSource(srchash)
         # Test foo actors still exist
-        assert 13.9, round(asys.ask(foo, 10.1, 1) == 2)
+        r = asys.ask(foo, 10.1, ask_wait)
+        assert 13.9 == round(r, 2)
         # Note: behavioral difference here between ActorSystems using
         # the local process memory (e.g. simpleSystemBase) and
         # ActorSystems using remote processes (e.g. multiprocTCPBase,
@@ -777,10 +1032,13 @@ class TestFuncLoadSource(object):
         # whereas the latter affects only *new* Actor processes, but
         # not existing processes, so the existing processes will still have the imports available.
         if asys.base_name in ['simpleSystemBase']:
-            assert isinstance(asys.ask(foo, 'good one', 1), PoisonMessage)
+            r = asys.ask(foo, 'good one', ask_wait)
+            assert isinstance(r, PoisonMessage)
         else:
-            assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
+            r = asys.ask(foo, 'good one', ask_wait)
+            assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), 3)
+        assert 'And MOO: great' == r
 
 
     # Unloading an actor source has indeterminate effects on running
@@ -798,7 +1056,8 @@ class TestFuncLoadSource(object):
     #     tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
     #     srchash = self._loadFooSource(asys, source_zips)
     #     foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-    #     assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
+    #     r = asys.ask(foo, 'good one', ask_wait)
+    #     assert 'GOT: good one' == r
     #     # Unload fooSource
     #     asys.unloadActorSource(srchash)
     #     # Verify cannot create sub-actor from still-existing actor from unloaded source
@@ -807,7 +1066,8 @@ class TestFuncLoadSource(object):
     #     # the removed source gives back an actorAddress to the
     #     # creating Actor, but the actor is never created and thus the
     #     # ask will timeout.
-    #     assert asys.ask(foo, ('discard', 'great'), 0.25) is None
+    #     r = asys.ask(foo, ('discard', 'great'), 0.25)
+    #     assert r is None
 
     #     # Now show that an attempt to get a running actor to import a
     #     # module that has been unloaded will cause that Actor to fail
@@ -829,7 +1089,8 @@ class TestFuncLoadSource(object):
                asys.createActor,
                'foo.FooActor', sourceHash=srchash)
         dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
-        assert 'Woof! bark' == asys.ask(dog, 'bark', 1)
+        r = asys.ask(dog, 'bark', ask_wait)
+        assert 'Woof! bark' == r
 
     def test04_verifyReloadOfChangedModuleAndUnloadOfOriginal(self, asys, source_zips):
         thesplog('ttm %s', asys.port_num)
@@ -837,8 +1098,10 @@ class TestFuncLoadSource(object):
         self._registerSA(asys)
         srchash = self._loadFooSource(asys, source_zips)
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
 
         # Update the foo sources
         from io import BytesIO
@@ -867,21 +1130,24 @@ class TestFuncLoadSource(object):
         raises(InvalidActorSourceHash,
                asys.createActor,
                'foo.FooActor', sourceHash=srchash)
-        assert 'TOG: good one' == asys.ask(foo2, 'good one', 1)
-        assert '& MOO: great' == asys.ask(foo2, ('discard', 'great'), 1)
+        r = asys.ask(foo2, 'good one', ask_wait)
+        assert 'TOG: good one' == r
+        r = asys.ask(foo2, ('discard', 'great'), ask_wait)
+        assert '& MOO: great' == r
 
-        assert 'COW: Moooo on 1' == asys.ask(foo2, 1, 1)
+        r = asys.ask(foo2, 1, ask_wait)
+        assert 'COW: Moooo on 1' == r
 
     def test06_sourceAuthorityCanRegister(self, asys):
         thesplog('ttn %s', asys.port_num)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
 
     def test07_sourceAuthorityRejectsInvalidSource(self, asys, source_zips):
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = self._loadFooSource(asys, source_zips)
@@ -895,21 +1161,23 @@ class TestFuncLoadSource(object):
         thesplog('tto %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
         assert srchash is not None
         sourceload_wait() # allow time for validation of source by source authority
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
 
     def test07_sourceAuthorityAcceptsValidSourceAfterBadSource(self, asys, source_zips):
         thesplog('ttp %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         failhash = asys.loadActorSource(dogzipFname)
@@ -917,8 +1185,10 @@ class TestFuncLoadSource(object):
         assert srchash is not None
         sourceload_wait() # allow time for validation of source by source authority
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
         raises(InvalidActorSourceHash,
                asys.createActor,
                'dog.DogActor', sourceHash = failhash)
@@ -927,7 +1197,7 @@ class TestFuncLoadSource(object):
         thesplog('ttq %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -937,15 +1207,18 @@ class TestFuncLoadSource(object):
         sourceload_wait() # allow time for validation of source by source authority
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
         dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'))
-        assert 'Woof! bark' == asys.ask(dog, 'bark', 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'))
+        assert 'And MOO: great' == r
+        r = asys.ask(dog, 'bark', ask_wait)
+        assert 'Woof! bark' == r
 
     def test07_multipleValidSourcesCanCommunicate(self, asys, source_zips):
         thesplog('ttr %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -955,15 +1228,18 @@ class TestFuncLoadSource(object):
         sourceload_wait() # allow time for validation of source by source authority
         cow = asys.createActor('barn.cow.moo.MooActor', sourceHash=srchash)
         dog = asys.createActor('dog.DogActor', sourceHash=srchash2)
-        assert 'Moo: good one' == asys.ask(cow, 'good one', 1)
-        assert 'Woof! good boy' == asys.ask(dog, 'good boy', 1)
-        assert 'And MOO: Ruff Ruff: hungry' == asys.ask(dog, ('hungry', cow), 1)
+        r = asys.ask(cow, 'good one', ask_wait)
+        assert 'Moo: good one' == r
+        r = asys.ask(dog, 'good boy', ask_wait)
+        assert 'Woof! good boy' == r
+        r = asys.ask(dog, ('hungry', cow), ask_wait)
+        assert 'And MOO: Ruff Ruff: hungry' == r
 
     def test07_sourceAuthorityAcceptsValidSourceResultIsCorrupted(self, asys, source_zips):
         thesplog('tts %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13CorruptAuthority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -982,10 +1258,12 @@ class TestFuncLoadSource(object):
             assert '' == 'Invalid exception thrown: %s (%s)'%(str(ex), type(ex))
 
     def test07_sourceAuthorityExceptions(self, asys, source_zips):
+        if asys.base_name != 'simpleSystemBase':
+            pytest.skip('Source load timeout is too long to wait for valid testing.')
         thesplog('ttt %s', asys.port_num)
         tmpdir, foozipFname, foozipEncFile, dogzipFname, dogzipEncFile = source_zips
         auth = asys.createActor(rot13FailAuthority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1002,8 +1280,10 @@ class rot13Authority(Actor):
             self.send(sender, 'Enabled')
         elif isinstance(msg, ValidateSource):
             clear = _decryptROT13(msg.sourceData)
-            if clear:
-                self.send(sender, ValidatedSource(msg.sourceHash, clear))
+            # clear will be None on decryption failure, this actively
+            # rejects the source load.
+            self.send(sender, ValidatedSource(msg.sourceHash, clear))
+
 
 class rot13CorruptAuthority(Actor):
     def receiveMessage(self, msg, sender):
@@ -1043,7 +1323,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1064,7 +1344,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1078,8 +1358,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
     def test08_loadableInRemoteSystemMatchingCapabilities(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1091,7 +1373,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1105,8 +1387,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
     def test08_multiSystemSharesLoadedSourcesIfExplicitlyAllowed(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1118,7 +1402,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1134,8 +1418,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
     def test08_multiSystemLoadedSourcesNotSharedIfExplicitlyDisallowed(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1147,7 +1433,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1162,8 +1448,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'FAILED (poisonous)' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'FAILED (poisonous)' == r
 
     def test08_multiSystemLoadedSourcesNotSharedIfSharingUnrecognized(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1175,7 +1463,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Dogs Allowed', None)
         # Specify a Source Authority and load the foo sources
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1190,8 +1478,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'FAILED (poisonous)' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'FAILED (poisonous)' == r
 
     def test08_loadableInRemoteSystemOnlyIfSourceComesFromConventionLeader(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1202,7 +1492,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys2.createActor(rot13Authority)
-        enabled = asys2.ask(auth, 'Enable', 1)
+        enabled = asys2.ask(auth, 'Enable', ask_wait)
         sourceauthority_reg_wait()
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
@@ -1224,8 +1514,10 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('AllowRemoteActorSources', 'yes')
         time.sleep(0.08)
         foo = asys2.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
 
     def test09_loadableInRemoteSystemUnloadedOnPrimaryUnload(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1236,7 +1528,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1248,10 +1540,13 @@ class TestFuncMultipleSystemsLoadSource(object):
         time.sleep(0.2) # Allow updates to propagate
 
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
         foo2 = asys2.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: another good one' == asys.ask(foo2, 'another good one', 1)
+        r = asys.ask(foo2, 'another good one', ask_wait)
+        assert 'GOT: another good one' == r
 
         # Now unload source and kill actors; they cannot be recreated on either system.
         asys.tell(foo, ActorExitRequest())
@@ -1274,7 +1569,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1286,10 +1581,13 @@ class TestFuncMultipleSystemsLoadSource(object):
         time.sleep(0.8) # Allow updates to propagate
 
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'And MOO: great' == asys.ask(foo, ('discard', 'great'), 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, ('discard', 'great'), ask_wait)
+        assert 'And MOO: great' == r
         foo2 = asys2.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: another good one' == asys.ask(foo2, 'another good one', 1)
+        r = asys.ask(foo2, 'another good one', ask_wait)
+        assert 'GOT: another good one' == r
 
         # Now unload source and kill actors; they cannot be recreated on either system.
         asys.tell(foo, ActorExitRequest())
@@ -1311,7 +1609,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1325,9 +1623,11 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'In a WORLD: Where Pigs Fly' == \
-            asys.ask(foo, [{'Foo Allowed': True}, 'Where Pigs Fly'], 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, [{'Foo Allowed': True}, 'Where Pigs Fly'], ask_wait)
+        assert 'In a WORLD: Where Pigs Fly' == r
+
 
     def test10_multiSystemStartSubActorByClassReferenceRemotely(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1338,7 +1638,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1352,9 +1652,11 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'In a WORLD: Where Pigs Fly' == \
-            asys.ask(foo, [{'Cows Allowed': True}, 'Where Pigs Fly'], 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, [{'Cows Allowed': True}, 'Where Pigs Fly'], ask_wait)
+        assert 'In a WORLD: Where Pigs Fly' == r
+
 
     def test10_multiSystemStartSubActorCannotStart(self, asys_pair, source_zips):
         asys, asys2 = asys_pair
@@ -1365,7 +1667,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         asys.updateCapability('Cows Allowed', None)
         asys.updateCapability('Dogs Allowed', None)
         auth = asys.createActor(rot13Authority)
-        enabled = asys.ask(auth, 'Enable', 1)
+        enabled = asys.ask(auth, 'Enable', ask_wait)
         assert enabled == 'Enabled'
         sourceauthority_reg_wait()
         srchash = asys.loadActorSource(foozipEncFile)
@@ -1379,6 +1681,7 @@ class TestFuncMultipleSystemsLoadSource(object):
         # create MooActor remotely, where the remote system will
         # obtain the sources from the local system as needed.
         foo = asys.createActor('foo.FooActor', sourceHash=srchash)
-        assert 'GOT: good one' == asys.ask(foo, 'good one', 1)
-        assert 'FAILED (poisonous)' == \
-            asys.ask(foo, [{'Elephants Allowed': True}, 'Where Pigs Fly'], 1)
+        r = asys.ask(foo, 'good one', ask_wait)
+        assert 'GOT: good one' == r
+        r = asys.ask(foo, [{'Elephants Allowed': True}, 'Where Pigs Fly'], ask_wait)
+        assert 'FAILED (poisonous)' == r

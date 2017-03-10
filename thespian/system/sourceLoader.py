@@ -1,4 +1,5 @@
-"""The sourceLoader is used to handle the import capabilities for hash-identified loaded sources.
+"""The sourceLoader is used to handle the import capabilities for
+hash-identified loaded sources.
 
 Sources are loaded via the ActorSystem().loadSource(...) operation,
 verified by the SourceAuthority, then made available for creating
@@ -104,6 +105,32 @@ else:
     exec("def do_exec(co, loc): exec co in loc\n")
 
 
+def find_future_end(s, startpos):
+    next_future = s.find(b'from __future__ import', startpos)
+    if next_future == -1:
+        return startpos
+    end_future = s.find(b'\n', next_future)
+    if -1 == end_future:
+        # Unlikely! A file containing only "from __future__ import"
+        # statements and no final newline on the last import... how
+        # bizarre.
+        return len(s)
+    return find_future_end(s, end_future + 1)
+
+def py3_source_converter(s):
+    end_future = find_future_end(s, 0)
+    # The following will introduce an off-by-one error in stack traces
+    # due to the added line.  A simple insertion is difficult because
+    # semicolons are not always the same as whitespace (e.g. "foo = 1;
+    # class Foo:\n" will not have the right indentation for the class
+    # definition.  A more refined approach could be used here, but the
+    # following is simple enough to accept the off-by-one error.
+    return b';'.join(filter(None, [s[:end_future].rstrip(),
+                                   b'import builtins',
+                                   b'builtins.__import__ = __hashimporter__',
+                                   b'\n' + s[end_future:]])) + b'\n'
+
+
 class ImportRePackage(ast.NodeTransformer):
     def __init__(self, sourceHashDot, topnames):
         self._sourceHashDot = sourceHashDot
@@ -144,13 +171,15 @@ def hashimporter(hash):
     """Returns an importer that can be provided as __import__ to try the
        hash first."""
     imp = getattr(importlib, '__import__', __import__)
+    holes = {}  # key = name, value = ignored
     def _hashsupplier(*args, **kw):
         if not args[0].startswith(hash):
-            hashargs = tuple([hash + args[0]] + list(args)[1:])
-            try:
-                return imp(*hashargs, **kw)
-            except ImportError:
-                pass
+            hashname = hash + args[0]
+            if not hashname in holes:
+                try:
+                    return imp(hashname, *(args[1:]), **kw)
+                except ImportError:
+                    holes[hashname] = True
         return imp(*args, **kw)
     return _hashsupplier
 
@@ -189,7 +218,8 @@ class HashLoader(LoaderBase):
             name = ospath.join(*tuple(moduleName.split('.'))) + '.py'
         else:
             name = moduleName + '.py'
-        codeproc = lambda s: fix_imports(s, name, hashRoot, self.finder.getZipTopLevelNames())
+        codeproc = lambda s: fix_imports(s, name, hashRoot,
+                                         self.finder.getZipTopLevelNames())
         try:
             # Ensure the file ends in a carriage-return.  The path
             # importer does this automatically and no trailing
@@ -199,18 +229,17 @@ class HashLoader(LoaderBase):
             # (e.g. ntlm.HTTPNtlmAuthHandler.py, so explicitly ensure
             # the proper line endings for the compiler.
             if sys.version_info >= (3,0):
-                converter = lambda s: codeproc(s + b'\n')
+                converter = lambda s: codeproc(py3_source_converter(s))
+                #converter = lambda s: codeproc(s + b'\n')
             else:
                 converter = lambda s: codeproc(s.replace('\r\n', '\n')+'\n')
-            code = self.finder.withZipElementSource(
-                name,
-                converter)
+            code = self.finder.withZipElementSource(name, converter)
 
             # Intercept uses of __import__ in the loaded module, which
             # bypasses the normal import machinery.
             if self.finder.src_builtins:
                 ### Python 3:
-                module.__dict__['__builtins__'] = self.finder.src_builtins
+                module.__dict__['__hashimporter__'] = self.finder.src_hashimporter
             else:
                 ### Python 2-ish
                 module.__dict__['__import__'] = self.finder.src_hashimporter
@@ -268,8 +297,11 @@ class HashRootLoader(LoaderBase):
 
 class SourceHashFinder(FinderBase):
     """This module finder looks in the specified hashedSource for the
-       indicated module to import and returns an appropriate HashLoader object if
-       the module is in that hashedSource.
+       indicated module to import and returns an appropriate
+       HashLoader object if the module is in that hashedSource.  This
+       finder replicates much of the zipimport functionality; the
+       replication is due to the need to prefix all imports with the
+       hashedSource identifier.
     """
     def __init__(self, srcHash, decryptor, enczfsrc):
         self.decryptor = decryptor
@@ -317,11 +349,13 @@ class SourceHashFinder(FinderBase):
     def getZipNames(self):
         return self._getFromZipFile(lambda z: z.namelist())
     def getZipTopLevelNames(self):
-        return set([N.partition('/')[0] for N in self.getZipNames() if N != '__init__.py'])
+        return set([N.partition('/')[0]
+                    for N in self.getZipNames()
+                    if N != '__init__.py'])
     def getZipDirectory(self):
         return self._getFromZipFile(lambda z: z.infolist())
     def withZipElementSource(self, elementname, onSrcFunc):
-        return self._getFromZipFile(lambda z: onSrcFunc(z.open(elementname, 'rU').read()))
+        return self._getFromZipFile(lambda z: onSrcFunc(z.read(elementname)))
     def find_spec(self, fullname, path=None, target=None):
         try:
             return self.find_module(fullname, path)
@@ -367,13 +401,15 @@ def loadModuleFromHashSource(sourceHash, sources, modName, modClass):
         logging.getLogger('Thespian').warning('Specified sourceHash %s is not currently loaded',
                                               sourceHash)
         raise InvalidActorSourceHash(sourceHash)
+    if not sources[sourceHash]:
+        raise ValueError('Local Actor does not have sources for hash %s' % sourceHash)
 
     for metapath in sys.meta_path:
         if getattr(metapath, 'srcHash', None) == sourceHash:
             return _loadModuleFromVerifiedHashSource(metapath, modName, modClass)
 
     edata = sources[sourceHash]
-    f = SourceHashFinder(sourceHash, lambda v: v, edata)
+    f = SourceHashFinder(sourceHash, lambda v: v, getattr(edata, 'zipsrc', edata))
     sys.meta_path.insert(0, f)
     return _loadModuleFromVerifiedHashSource(f, modName, modClass)
 

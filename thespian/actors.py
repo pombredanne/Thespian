@@ -1,21 +1,27 @@
-"""Actor model execution framework (see https://en.wikipedia.org/wiki/Actor_model).
+"""\
+Actor model execution framework providing concurrency and
+transport independence.
 
 For more details, see http://thespianpy.com
 
-Thespian Generation 3.0
+Thespian Generation 3.6
 """
 
-ThespianGeneration = (3, 0)
+ThespianGeneration = (3, 6)
 
 
-class ActorSystemException(Exception): pass
+class ActorSystemException(Exception):
+    pass
+
 
 class InvalidActorAddress(ActorSystemException):
     '''Exception thrown if an ActorAddress is not valid (i.e. synthesized
-    or altered) or could not be generated.'''
+       or altered) or could not be generated.
+    '''
     def __init__(self, addr, desc, *args, **kw):
         self.actorAddress = addr
-        ActorSystemException.__init__(self, str(addr) + ' is ' + desc, *args, **kw)
+        ActorSystemException.__init__(self, str(addr) + ' is ' + desc,
+                                      *args, **kw)
 
 
 class ActorSystemFailure(ActorSystemException):
@@ -28,47 +34,54 @@ class ActorSystemStartupFailure(ActorSystemFailure):
 
 
 class ActorSystemRequestTimeout(ActorSystemFailure):
-    "Thrown if ActorSystem cannot complete request in stipulated or reasonable time period."
+    """ActorSystem cannot complete request in stipulated or reasonable
+       time period.
+    """
     pass
 
 
 class NoCompatibleSystemForActor(ActorSystemException):
-    "Thrown if Actor cannot be started because no ActorSystem matches the needed capabilities"
+    """Actor cannot be started because no ActorSystem matches the needed
+       capabilities.
+    """
     def __init__(self, actorClass, msg, *args, **kw):
-        ActorSystemException.__init__(self, msg + " for Actor {0}".format(str(actorClass)), *args, **kw)
+        ActorSystemException.__init__(
+            self, msg + " for Actor " + str(actorClass),
+            *args, **kw)
 
 
 class InvalidActorSourceHash(ActorSystemException):
     "Thrown on request to use a non-existent source hash."
     def __init__(self, badHash):
-        ActorSystemException.__init__(self,
-                                      'Source hash %s does not match any loaded sources.'%(
-                                          badHash))
+        ActorSystemException.__init__(
+            self,
+            'Source hash %s does not match any loaded sources.' % badHash)
+
 
 class InvalidActorSpecification(ActorSystemException):
     "Caller specified an invalid Actor Class for a createActor() request."
-    def __init__(self, badActorClassSpecification):
+    def __init__(self, badActorClassSpecification, reason=None):
         super(InvalidActorSpecification, self).__init__(
-            'Invalid Actor Specification: %s'%str(badActorClassSpecification))
+            'Invalid Actor Specification: ' + str(badActorClassSpecification) +
+            ((' (%s)' % reason) if reason else ''))
 
 
-
-class ActorAddress:
+class ActorAddress(object):
     '''Used to reference a specific Actor (or Troupe).  The Actor could be
-    local or remote, in another thread, or another process.  The actor
-    is not even guaranteed to be alive anymore.  Regardless, this is
-    the identifier by which messages can be directed to an Actor.
+       local or remote, in another thread, or another process.  The
+       actor is not even guaranteed to be alive anymore.  Regardless,
+       this is the identifier by which messages can be directed to an
+       Actor.
     '''
     def __init__(self, aaddr):
         '''Can only be constructed by the ActorSystem(); cannot be constructed
-        or synthesized externally.
+           or synthesized externally.
 
-        The aaddr is meant to be an opaque reference generated
-        internally by the ActorSystem implementation and used by it
-        for routing purposes.  The user may request a string-version
-        of the aaddr, but this should be used for informative or
-        display purposes only.
-
+           The aaddr is meant to be an opaque reference generated
+           internally by the ActorSystem implementation and used by it
+           for routing purposes.  The user may request a
+           string-version of the aaddr, but this should be used for
+           informative or display purposes only.
         '''
         self._aaddr = aaddr
 
@@ -81,16 +94,21 @@ class ActorAddress:
             return self._aaddr
         return str(self._aaddr)
 
-    def __str__(self): return 'ActorAddr-%s'%str(self._aaddr)
+    def __str__(self): return 'ActorAddr-' + str(self._aaddr)
 
     def __eq__(self, o):
         if hasattr(self, 'eqOverride'):
             return self.eqOverride(o)
+        if hasattr(o, 'eqOverride'):
+            return o.eqOverride(self)
         try:
             return self.addressDetails == o.addressDetails
-        except:
+        except Exception:
             return False
+
     def __ne__(self, o): return not self.__eq__(o)
+
+    __hash__ = None
 
 
 class Actor(object):
@@ -123,7 +141,8 @@ class Actor(object):
         pass
 
     def __str__(self):
-        return '{A:' + self.__class__.__name__ + ' @ ' + str(self.myAddress) + '}'
+        return '{A:' + self.__class__.__name__ + \
+            ' @ ' + str(self.myAddress) + '}'
 
     def receiveMessage(self, msg, sender):
         '''Main entry point handling a request received by this Actor.  Runs
@@ -133,16 +152,21 @@ class Actor(object):
         '''
         noPyLintWarnings = msg, sender
         assert False, \
-            'default Actor.receiveMessage for "%s" must be overridden to handle messages'%self
+            'default Actor.receiveMessage for "' + \
+            str(self) + \
+            '" must be overridden to handle messages'
 
     @property
     def myAddress(self):
         "Returns the ActorAddress of this Actor itself."
         return self._myRef.address
 
-    def createActor(self, actorClass, targetActorRequirements=None, globalName=None, sourceHash = None):
-        """Initiates creation of a new child Actor of the specified Class.  Returns the ActorAddress for that child
-           Actor.
+    def createActor(self, actorClass,
+                    targetActorRequirements=None,
+                    globalName=None,
+                    sourceHash=None):
+        """Initiates creation of a new child Actor of the specified Class.
+           Returns the ActorAddress for that child Actor.
 
            If the optional globalName parameter is specified, the
            ActorSystem will first check for a registered Actor under
@@ -152,19 +176,28 @@ class Actor(object):
            necessarily the current Actor).  If no Actor is registered
            under that name, the requested Actor is created and
            registered under that name.
+
         """
-        return self._myRef.createActor(actorClass, targetActorRequirements, globalName, sourceHash)
+        return self._myRef.createActor(actorClass,
+                                       targetActorRequirements,
+                                       globalName,
+                                       sourceHash)
 
     def send(self, targetAddr, msg):
         """Sends a message to another Actor (specified via ActorAddress) from
            this Actor.  The msg must be pickle-able."""
         if not isinstance(targetAddr, ActorAddress):
-            raise InvalidActorAddress(targetAddr,
-                                      'not a valid ActorAddress for sending messages to')
+            raise InvalidActorAddress(
+                targetAddr,
+                'not a valid ActorAddress for sending messages to')
         self._myRef.actor_send(targetAddr, msg)
 
     def wakeupAfter(self, timePeriod):
-        "Requests delivery of a WakeupMessage after the specified period of time."
+        """Requests delivery of a WakeupMessage after the specified period of
+           time.  This may be called multiple times to request
+           multiple wakup deliveries.  There is no mechanism to cancel
+           requested wakeups.
+        """
         self._myRef.wakeupAfter(timePeriod)
 
     def handleDeadLetters(self, startHandling=True):
@@ -182,9 +215,10 @@ class Actor(object):
         self._myRef.registerSourceAuthority(self.myAddress)
 
     def notifyOnSystemRegistrationChanges(self, startHandling=True):
-        """Registers this Actor with the ActorSystem as a recipient of 
+        """Registers this Actor with the ActorSystem as a recipient of
            ActorSystemConventionUpdate messages."""
-        self._myRef.notifyOnSystemRegistrationChanges(self.myAddress, startHandling)
+        self._myRef.notifyOnSystemRegistrationChanges(self.myAddress,
+                                                      startHandling)
 
     def logger(self, name=None):
         return self._myRef.logger(name)
@@ -213,6 +247,12 @@ class Actor(object):
            sources then this operation will be ignored.
         """
         return self._myRef.unloadActorSource(sourceHash)
+
+    def notifyOnSourceAvailability(self, enable=True):
+        """Registers this Actor with the ActorSystem as a recipient of
+           LoadedSource and UnloadedSource notification messages.
+        """
+        self._myRef.notifyOnSourceAvailability(self.myAddress, enable)
 
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     # Most actors will not use the below, but they can be used
@@ -245,13 +285,29 @@ class Actor(object):
            call.  This removed state is not enforced: if the remote
            system initiates connectivity with the local system after
            this call then it will be re-entered into the Convention.
+
+           The remoteAddress may either be a raw address appropriate
+           to the transport time (as supplied to the
+           `preRegisterRemoteSystem()` call) or the ActorAddress of
+           the remote Administrator (as obtained from the
+           ActorSystemConventionUpdate message, for example).
+
         """
         self._myRef.deRegisterRemoteSystem(remoteAddress)
 
 
+    def actorSystemShutdown(self):
+        """Allows an Actor to request the shutdown of the entire Actor System.
+           This is dangerous and fatal for the entire local actor
+           system; use with care.
+        """
+        self._myRef.actorSystemShutdown()
+
 
 class ActorSystemMessage(object):
-    "Base class for all ActorSystem Messages for easier isinstance identification"
+    """Base class for all ActorSystem Messages for easier isinstance
+       identification.
+    """
     pass
 
 
@@ -260,23 +316,75 @@ class ActorSystemConventionUpdate(ActorSystemMessage):
        ActorSystem Convention updates via their
        notifyOnSystemRegistrationChanges calls.
     """
-    def __init__(self, adminAddress, capabilities = None, added = True):
+    def __init__(self, adminAddress, capabilities=None, added=True):
         self._remoteAdminAddress = adminAddress
-        self._capabilities       = capabilities
-        self._added              = added # if False, remote system actively de-registered
+        self._capabilities = capabilities
+        self._added = added   # if False, remote system actively de-registered
 
     @property
     def remoteAdminAddress(self): return self._remoteAdminAddress
+
     @property
     def remoteCapabilities(self): return self._capabilities
+
     @property
     def remoteAdded(self): return self._added
+
     def __eq__(self, o):
         return isinstance(o, ActorSystemConventionUpdate) \
             and self._remoteAdminAddress == o._remoteAdminAddress \
             and self._capabilities == o._capabilities \
             and self._added == o._added
+
     def __ne__(self, o): return not self.__eq__(o)
+
+    def __str__(self):
+        return ('ActorSystemConventionUpdate(remoteAdminAddress=%s'
+                ', remoteAdded=%s, remoteCapabilities=%s' %
+                (str(self.remoteAdminAddress),
+                 str(self.remoteAdded),
+                 str(self.remoteCapabilities)))
+
+
+class _SourceChangeNotification(ActorSystemMessage):
+    """This is the base class for messages delivered to actors that have
+       registered for notification of loaded changes via the
+       notifyOnSourceAvailability call.  This message is not delivered
+       directly; one of the subclasses (LoadedSource or
+       UnloadedSource) is delivered to the notification registree.
+    """
+    def __init__(self, sourceHash, sourceInfo):
+        self.sourceHash = sourceHash
+        self.sourceInfo = sourceInfo
+
+    def __eq__(self, o):
+        return str(self) == str(o)
+
+    def __ne__(self, o):
+        return not self.__eq__(o)
+
+
+class LoadedSource(_SourceChangeNotification):
+    """This message is delivered to actors that have registered for
+       notification of loaded changes via the
+       notifyOnSourceAvailability call.  This message is sent when a
+       new source is loaded and useable for creating actors.
+    """
+    def __str__(self):
+        return ('LoadedSource(sourceHash=%s, sourceInfo=%s)' %
+                (str(self.sourceHash), str(self.sourceInfo)))
+
+
+class UnloadedSource(_SourceChangeNotification):
+    """This message is delivered to actors that have registered for
+       notification of loaded changes via the
+       notifyOnSourceAvailability call.  This message is sent when an
+       existing source has been unloaded and is no longer useable for
+       creating actors.
+    """
+    def __str__(self):
+        return ('UnloadedSource(sourceHash=%s, sourceInfo=%s)' %
+                (str(self.sourceHash), str(self.sourceInfo)))
 
 
 class ActorExitRequest(ActorSystemMessage):
@@ -300,11 +408,14 @@ class ActorExitRequest(ActorSystemMessage):
         self._recursive = recursive
 
     def __str__(self): return 'ActorExitRequest'
+
     def __eq__(self, o): return isinstance(o, ActorExitRequest)
+
     def __ne__(self, o): return not self.__eq__(o)
 
     @property
     def isRecursive(self): return self._recursive
+
     def notRecursive(self): self._recursive = False
 
 
@@ -317,7 +428,11 @@ class ChildActorExited(ActorSystemMessage):
 
     def __str__(self):
         return 'ChildActorExited:' + str(self._childAddr)
-    def __eq__(self, o): return isinstance(o, ChildActorExited) and self._childAddr == o._childAddr
+
+    def __eq__(self, o):
+        return isinstance(o, ChildActorExited) and \
+            self._childAddr == o._childAddr
+
     def __ne__(self, o): return not self.__eq__(o)
 
     @property
@@ -329,39 +444,60 @@ class ChildActorExited(ActorSystemMessage):
 class PoisonMessage(ActorSystemMessage):
     """Message wrapper used to return a message to the sender that has
        caused multiple failures in a recipient Actor."""
-    def __init__(self, poison):
+    def __init__(self, poison, details=None):
         self._poison = poison
+        self._details = details
+
     @property
     def poisonMessage(self):
         "Returns the actual message that poisoned the target Actor."
         return self._poison
-    def __str__(self): return 'Poison<%s>'%str(self.poisonMessage)
-    def __eq__(self, o): return isinstance(o, PoisonMessage) and self._poison == o._poison
+
+    @property
+    def details(self):
+        return self._details
+
+    def __str__(self):
+        if self.details:
+            return 'Poison<%s>: %s' %(str(self.poisonMessage), str(self.details))
+        return 'Poison<%s>' % str(self.poisonMessage)
+
+    def __eq__(self, o):
+        return isinstance(o, PoisonMessage) and self._poison == o._poison
+
     def __ne__(self, o): return not self.__eq__(o)
 
 
 class WakeupMessage(ActorSystemMessage):
-    """Message sent as a result of a .wakeupAfter() call.  The .delayPeriod value is the amount of time of the delay."""
+    """Message sent as a result of a .wakeupAfter() call.  The
+       delayPeriod value is the amount of time of the delay.
+    """
     def __init__(self, delayPeriod):
         self.delayPeriod = delayPeriod
+
     def __str__(self):
-        return 'WakeupMessage(%s)'%str(self.delayPeriod)
-    def __eq__(self, o): return isinstance(o, WakeupMessage) and self.delayPeriod == o.delayPeriod
+        return 'WakeupMessage(%s)' % str(self.delayPeriod)
+
+    def __eq__(self, o):
+        return isinstance(o, WakeupMessage) and \
+            self.delayPeriod == o.delayPeriod
+
     def __ne__(self, o): return not self.__eq__(o)
 
 
 class ThespianWatch(object):
     """If an Actor's receiveMessage returns this object, it specifies a
-    list of fileno's to watch for activity/availability (in addition
-    to the normal mailbox for the Actor).  If any of these fileno's
-    become ready, the Actor's receiveMessage will be called with a
-    WatchMessage and a list of those ready fileno's.
+       list of fileno's to watch for activity/availability (in
+       addition to the normal mailbox for the Actor).  If any of these
+       fileno's become ready, the Actor's receiveMessage will be
+       called with a WatchMessage and a list of those ready fileno's.
 
-    Support for watch capability is dependent on the system base and
-    hosting operating system.  ...
+       Support for watch capability is dependent on the system base
+       and hosting operating system.  ...
     """
     def __init__(self, filenos):
         self.filenos = filenos
+
 
 class WatchMessage(ActorSystemMessage):
     """Message sent to an Actor with a subset of the filenos in the
@@ -386,29 +522,48 @@ class DeadEnvelope(ActorSystemMessage):
         if isinstance(self.deadMessage, DeadEnvelope):
             if id(self.deadMessage.deadMessage) == id(self):
                 return 'Self-referential-once-removed DeadEnvelope!'
-        return 'DeadEnvelope(%s)->%s'%(str(self.deadMessage), str(self.deadAddress))
+        return 'DeadEnvelope(%s)->%s' % (str(self.deadMessage),
+                                         str(self.deadAddress))
+
     def __eq__(self, o):
         return isinstance(o, DeadEnvelope) \
             and self.deadMessage == o.deadMessage \
             and self.deadAddress == o.deadAddress
+
     def __ne__(self, o): return not self.__eq__(o)
 
 
 class ValidateSource(ActorSystemMessage):
-    "Provides loadActorSource input that should be validated (and possibly decrypted)."
-    def __init__(self, sourceHash, sourceData):
+    """Provides loadActorSource input that should be validated (and
+       possibly decrypted).
+    """
+    def __init__(self, sourceHash, sourceData, sourceInfo=None):
         self.sourceHash = sourceHash
         self.sourceData = sourceData
-    def __eq__(self, o): return isinstance(o, ValidateSource) and self.sourceHash == o.sourceHash
+        self.sourceInfo = sourceInfo
+
+    def __eq__(self, o):
+        return isinstance(o, ValidateSource) and \
+            self.sourceHash == o.sourceHash
+
     def __ne__(self, o): return not self.__eq__(o)
 
 
 class ValidatedSource(ActorSystemMessage):
-    "The response to the ValidateSource providing the validated source code to enable."
-    def __init__(self, sourceHash, sourceZip):
+    """The response to the ValidateSource providing the validated source
+       code to enable.  The sourceZip parameter should be binary
+       Zipfile data; if it is None then the Source Authority is
+       actively rejecting the source and this sourceHash is not valid.
+    """
+    def __init__(self, sourceHash, sourceZip, sourceInfo=None):
         self.sourceHash = sourceHash
         self.sourceZip  = sourceZip
-    def __eq__(self, o): return isinstance(o, ValidatedSource) and self.sourceHash == o.sourceHash
+        self.sourceInfo = sourceInfo
+
+    def __eq__(self, o):
+        return isinstance(o, ValidatedSource) and \
+            self.sourceHash == o.sourceHash
+
     def __ne__(self, o): return not self.__eq__(o)
 
 
@@ -456,44 +611,52 @@ class ActorSystem(object):
     """
 
     def __init__(self,
-                 systemBase = None,
-                 capabilities = None,
-                 logDefs = None,
-                 transientUnique = False):
-        systemBase = self._startupActorSys(None if transientUnique
-                                           else getattr(self.__class__, 'systemBase', None),
-                                           systemBase, capabilities, logDefs)
+                 systemBase=None,
+                 capabilities=None,
+                 logDefs=None,
+                 transientUnique=False):
+        systemBase = self._startupActorSys(
+            None if transientUnique
+            else getattr(self.__class__, 'systemBase', None),
+            systemBase, capabilities, logDefs)
         if transientUnique:
             self._isTransientUnique = True
         else:
             # (Re-)Set the Singleton systemBase
             self.__class__.systemBase = systemBase
 
-
-    def _startupActorSys(self, currentSystemBase, systemBase, capabilities, logDefs):
+    def _startupActorSys(self, currentSystemBase,
+                         systemBase,
+                         capabilities,
+                         logDefs):
         self.systemAddress = ActorAddress('/ActorSys')
         self.capabilities = capabilities or dict()
         if 'logging' in self.capabilities:
             import logging
-            logging('Thespian').warning('logging specification moved from capabilities to an explicit argument.')
+            logging('Thespian').warning(
+                'logging specification moved'
+                ' from capabilities to an explicit argument.')
         if systemBase is None:
             systemBase = currentSystemBase
             if systemBase is None:
                 import thespian.system.simpleSystemBase
-                systemBase = thespian.system.simpleSystemBase.ActorSystemBase(self, logDefs = logDefs)
+                systemBase = thespian.system \
+                                     .simpleSystemBase \
+                                     .ActorSystemBase(self,
+                                                      logDefs=logDefs)
         elif isinstance(systemBase, str):
             import sys
-            if sys.version_info < (2,7):
+            if sys.version_info < (2, 7):
                 import thespian.importlib as importlib
             else:
                 import importlib
-            # n.b. let standard import exception indicate a missing/unknown systemBase
-            module = importlib.import_module('thespian.system.%s'%systemBase)
+            # n.b. standard import exception indicates a missing/unknown systemBase
+            module = importlib.import_module('thespian.system.' + systemBase)
             sbc = getattr(module, 'ActorSystemBase')
             if currentSystemBase and id(currentSystemBase.__class__) == id(sbc):
                 systemBase = currentSystemBase
             else:
-                systemBase = sbc(self, logDefs = logDefs)
+                systemBase = sbc(self, logDefs=logDefs)
         elif systemBase and currentSystemBase:
             if id(systemBase.__class__) == id(currentSystemBase.__class__):
                 systemBase = currentSystemBase
@@ -501,46 +664,58 @@ class ActorSystem(object):
         self._systemBase = systemBase
         return systemBase
 
-
     def shutdown(self):
-        "Called to shutdown the ActorSystem itself.  May block until all Actors are shutdown."
-        if self._systemBase: self._systemBase.shutdown()
+        """Called to shutdown the ActorSystem itself.  May block until all
+           Actors are shutdown.
+        """
+        if self._systemBase:
+            self._systemBase.shutdown()
         if not getattr(self, '_isTransientUnique', False):
             if getattr(self.__class__, 'systemBase', None) == self._systemBase:
                 delattr(self.__class__, 'systemBase')
         self._systemBase = None
 
-
     def createActor(self, actorClass,
                     targetActorRequirements=None,
                     globalName=None,
                     sourceHash=None):
-        'Called to create a "Primary" Actor (a top-level Actor owned by the system itself).'
-        return self._systemBase.newPrimaryActor(actorClass, targetActorRequirements,
-                                                globalName, sourceHash)
+        '''Called to create a "Primary" Actor (a top-level Actor owned by the
+           system itself).
+        '''
+        return self._systemBase.newPrimaryActor(actorClass,
+                                                targetActorRequirements,
+                                                globalName,
+                                                sourceHash)
 
     def tell(self, actorAddr, msg):
-        "Sends msg to the Actor at the specified address.  No response is expected or awaited."
+        """Sends msg to the Actor at the specified address.  No response is
+           expected or awaited.
+        """
         if not isinstance(actorAddr, ActorAddress):
-            raise ValueError('Actor tell address is not a valid ActorAddress: %s'%(type(actorAddr)))
+            raise ValueError(
+                "Actor `tell' address \"%s\" is not a valid ActorAddress: %s" %
+                (str(actorAddr), str(type(actorAddr))))
         self._systemBase.tell(actorAddr, msg)
 
     def listen(self, timeout=None):
         """Waits for a message from any Actor.  The optional timeout argument
-        specifies the maximum amount of time to wait in fractional
-        seconds.  Returns None if no response is received in the
-        indicated time period.
+           specifies the maximum amount of time to wait in fractional
+           seconds.  Returns None if no response is received in the
+           indicated time period.
         """
         return self._systemBase.listen(timeout)
 
     def ask(self, actorAddr, msg, timeout=None):
         """Sends msg to the addressed Actor and waits for a response (from
-        *any* Actor).  The optional timeout argument specifies the
-        maximum amount of time to wait in fractional seconds.  Returns
-        None if no response is received in the indicated time period.
+           *any* Actor).  The optional timeout argument specifies the
+           maximum amount of time to wait in fractional seconds.
+           Returns None if no response is received in the indicated
+           time period.
         """
         if not isinstance(actorAddr, ActorAddress):
-            raise ValueError('Actor ask address "%s" is not a valid ActorAddress'%str(actorAddr))
+            raise ValueError(
+                "Actor `ask' address is not a valid ActorAddress: " +
+                str(actorAddr))
         return self._systemBase.ask(actorAddr, msg, timeout)
 
     def _handleDeadLetters(self, address, enable):
@@ -552,10 +727,14 @@ class ActorSystem(object):
            generally recommended and is intended for unusual
            circumstances like unit test controls, etc.
         """
-        return getattr(self._systemBase, updateType, lambda *a, **kw: None)(*updateArgs, **updateKWArgs)
+        return getattr(self._systemBase,
+                       updateType,
+                       lambda *a, **kw: None)(*updateArgs, **updateKWArgs)
 
     def updateCapability(self, capabilityName, capabilityValue=None):
-        "Adds/modifies an ActorSystem capability (or removes it if the value is None or not specified)."
+        """Adds/modifies an ActorSystem capability (or removes it if the value
+           is None or not specified).
+        """
         self._systemBase.updateCapability(capabilityName, capabilityValue)
         if capabilityValue is None:
             if capabilityName in self.capabilities:
@@ -563,14 +742,11 @@ class ActorSystem(object):
         else:
             self.capabilities[capabilityName] = capabilityValue
 
-
     def loadActorSource(self, fname):
         return self._systemBase.loadActorSource(fname)
 
-
     def unloadActorSource(self, sourceHash):
         return self._systemBase.unloadActorSource(sourceHash)
-
 
 
 def requireCapability(cap, value=True):
@@ -579,16 +755,18 @@ def requireCapability(cap, value=True):
         capCheck0 = None
         if hasattr(cls, 'actorSystemCapabilityCheck'):
             capCheck0 = cls.actorSystemCapabilityCheck
+
         @staticmethod
         def capCheck1(caps, reqs):
-            return caps.get(cap, False) == value and (capCheck0(caps,reqs)
-                                                      if capCheck0 else True)
+            return caps.get(cap, False) == value and \
+                (capCheck0(caps, reqs) if capCheck0 else True)
         cls.actorSystemCapabilityCheck = capCheck1
         return cls
     return go
 
 
 import inspect
+
 
 class ActorTypeDispatcher(Actor):
     """This is an enhancement on the base Actor where the receiveMessage
@@ -615,17 +793,20 @@ class ActorTypeDispatcher(Actor):
 
     def receiveMessage(self, message, sender):
         for each in inspect.getmro(message.__class__):
-            methodName = 'receiveMsg_%s'%each.__name__
+            methodName = 'receiveMsg_' + each.__name__
             if hasattr(self, methodName):
-                for klasses in inspect.getmro(self.__class__):
-                    if hasattr(klasses, methodName):
-                        rval = getattr(klasses, methodName)(self, message, sender)
-                        if rval != self.SUPER:
-                            return rval
+                for klass in inspect.getmro(self.__class__):
+                    if hasattr(klass, methodName):
+                        r = getattr(klass, methodName)(self, message, sender)
+                        if r != self.SUPER:
+                            return r
         if hasattr(self, 'receiveUnrecognizedMessage'):
             return self.receiveUnrecognizedMessage(message, sender)
 
 
+# Tentative exposure of these messages.  These are not fully
+# documented and subject to change or removal; do not use in critical
+# path elements.
 from thespian.system.messages.status import (Thespian_StatusReq,
                                              Thespian_SystemStatus,
                                              Thespian_ActorStatus)

@@ -1,4 +1,4 @@
-#+TITLE: [[http://thespianpy.com][@@html:<img src="thesplogo2.png" alt="Thespian" width="50%" display="inline" />@@]] In-Depth Introduction
+#+TITLE: [[http://thespianpy.com][@@html:<img src="thesplogo2.png" alt="Thespian" width="50%" style="inline" />@@]] In-Depth Introduction
 #+AUTHOR: Kevin Quick <kquick@godaddy.com>
 #+SETUPFILE: theme.setup
 #+HTML_HEAD: <link href="thespian.css" rel="stylesheet" type="text/css"/>
@@ -614,7 +614,7 @@ kquick 5595 5594  0 21:51 pts/86  00:00:00 logger ActorAddr-(TCP|10.56.10.5:5186
   return to our original ~hello.py~ sample:
 
 #+CAPTION: hello.py:
-#+NAME: hello.py
+#+NAME: hello2.py
 #+BEGIN_SRC python -n -r -l "#(ref:%s)" :file hello.py :tangle code/hello.py
 from thespian.actors import *
 

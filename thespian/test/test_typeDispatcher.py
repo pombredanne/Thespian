@@ -1,8 +1,14 @@
 import pytest
 import logging
 import time, datetime
+import re
 from thespian.test import *
 from thespian.actors import *
+from thespian.system.utilis import fmap
+from datetime import timedelta
+
+
+MAX_ASK_DELAY = timedelta(seconds=3)
 
 
 class Message1(object):
@@ -79,13 +85,22 @@ def top(request, asys):
 class TestFuncTypeDispatching(object):
 
     def verifyExpectedResponses(self, asys, target, requestMsg, expected):
-        resp = asys.ask(target, requestMsg, 1.1)
+        resp = asys.ask(target, requestMsg, MAX_ASK_DELAY)
         if expected == None:
             assert resp is None
         else:
             while resp and expected:
-                assert resp in expected
-                del expected[expected.index(resp)]
+                for n,e in enumerate(expected):
+                    if hasattr(e, 'search'):
+                        if e.search(resp):
+                            break
+                    else:
+                        if e == resp:
+                            break
+                else:
+                    assert False, 'Expected "%s" not found in: %s'%(
+                        resp, fmap(str, expected))
+                del expected[n]
                 resp = asys.listen(0.1)
             assert len(expected) == 0
 
@@ -116,18 +131,20 @@ class TestFuncTypeDispatching(object):
     def testMiddleInt(self, asys, middle):
         import sys
         tname = 'class' if sys.version_info >= (3,0,0) else 'type'
-        self.verifyExpectedResponses(asys, middle, 9, ["didn't recognize: <%s 'int'>"%tname])
+        self.verifyExpectedResponses(
+            asys, middle, 9,
+            [re.compile("didn't recognize: <%s 'int'(| at 0x[0-9a-f]+)>"%tname)])
 
     def testMiddleMsg1(self, asys, middle):
         self.verifyExpectedResponses(asys, middle, Message1(), ["got m1"])
 
     def testMiddleMsg2(self, asys, middle):
         expected = ["middle got m2", "got m1"]
-        resp = asys.ask(middle, Message2(), 0.1)
+        resp = asys.ask(middle, Message2(), MAX_ASK_DELAY)
         while resp:
             assert resp in expected
             del expected[expected.index(resp)]
-            resp = asys.listen(0.1)
+            resp = asys.listen(MAX_ASK_DELAY)
         assert len(expected) == 0
 
     def testMiddleMsg3(self, asys, middle):
@@ -147,12 +164,12 @@ class TestFuncTypeDispatching(object):
 
     def testTopMsg2(self, asys, top):
         expected = ["top got m2"]
-        resp = asys.ask(top, Message2(), 0.1)
+        resp = asys.ask(top, Message2(), MAX_ASK_DELAY)
         print('resp',resp)
         while resp:
             assert resp in expected
             del expected[expected.index(resp)]
-            resp = asys.listen(0.1)
+            resp = asys.listen(MAX_ASK_DELAY)
             print('resp',resp)
         assert len(expected) == 0
 
@@ -169,10 +186,15 @@ class TestFuncTypeDispatching(object):
         self.verifyExpectedResponses(asys, bottom, StrangeMessage2(), None)
 
     def testMiddleStrangeSubclass(self, asys, middle):
-        self.verifyExpectedResponses(asys, middle, StrangeMessage1(), ["middle got #3"])
+        self.verifyExpectedResponses(asys, middle,
+                                     StrangeMessage1(), ["middle got #3"])
 
     def testMiddleUnrecognized(self, asys, middle):
-        self.verifyExpectedResponses(asys, middle, StrangeMessage2(), ["didn't recognize: <class 'thespian.test.test_typeDispatcher.StrangeMessage2'>"])
+        self.verifyExpectedResponses(
+            asys, middle, StrangeMessage2(),
+            [re.compile("didn't recognize: <class "
+                        "'thespian.test.test_typeDispatcher.StrangeMessage2'"
+                        "(| at 0x[0-9a-f]+)>")])
 
     def testTopStrangeSubclass(self, asys, top):
         self.verifyExpectedResponses(asys, top, StrangeMessage1(),
@@ -180,7 +202,9 @@ class TestFuncTypeDispatching(object):
                                       "middle got #3"])
 
     def testTopUnrecognized(self, asys, top):
-        self.verifyExpectedResponses(asys, top, StrangeMessage2(),
-                                     ["didn't recognize: <class "
-                                      "'thespian.test.test_typeDispatcher.StrangeMessage2'>"])
+        self.verifyExpectedResponses(
+            asys, top, StrangeMessage2(),
+            [re.compile("didn't recognize: <class "
+                        "'thespian.test.test_typeDispatcher.StrangeMessage2'"
+                        "(| at 0x[0-9a-f]+)>")])
 

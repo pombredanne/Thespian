@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from thespian.actors import *
 import random
 from thespian.test import *
-from thespian.system.utilis import timePeriodSeconds
+from thespian.system.timing import timePeriodSeconds
 import pytest
 
 
@@ -144,6 +144,7 @@ noLogging = { 'version' : 1,
               'disable_existing_loggers': True,
               }
 
+testAdminPort = 59300
 
 def start_actor_system(name):
     caps = {}

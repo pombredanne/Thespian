@@ -4,6 +4,11 @@ from datetime import timedelta
 from thespian.test import ActorSystemTestCase, simpleActorTestLogging
 from thespian.actors import *
 from thespian.system.messages.status import *
+from thespian.system.utilis import fmap
+
+
+MAX_ASK_DELAY = timedelta(seconds=2)
+wait_for_registration = lambda: inTestDelay(timedelta(milliseconds=250))
 
 
 class PreRegistrationActor(ActorTypeDispatcher):
@@ -27,6 +32,21 @@ class Cow(ActorTypeDispatcher):
     def receiveMsg_str(self, strmsg, sender):
         self.send(sender, 'Moo: ' + strmsg)
 
+
+class NotificationHandler(ActorTypeDispatcher):
+    def __init__(self, *args, **kw):
+        super(NotificationHandler, self).__init__(*args, **kw)
+        self.notifications = []
+
+    def receiveMsg_str(self, strmsg, sender):
+        self.send(sender, self.notifications)
+
+    def receiveMsg_bool(self, boolmsg, sender):
+        self.notifyOnSystemRegistrationChanges(boolmsg)
+
+    def receiveMsg_ActorSystemConventionUpdate(self, update, sender):
+        newn = [N for N in self.notifications if N.remoteAdminAddress != update.remoteAdminAddress]
+        self.notifications = newn + [update]
 
 
 def showAdminStatus(actorSys):
@@ -63,6 +83,7 @@ class TestFuncRegistration(object):
         rsp = asys.ask(regActor, ("Register", "127.0.0.1:%d"%(asys2.port_num),
                                   {'moo': True}),
                        timedelta(seconds=2))
+        wait_for_registration()
         showAdminStatus(asys)
         showAdminStatus(asys2)
         horse = asys.createActor(Horse)
@@ -74,6 +95,152 @@ class TestFuncRegistration(object):
         # dropped the moo capability, so it stillshould not be
         # possible to create a Cow Actor.
         raises(NoCompatibleSystemForActor, asys.createActor, Cow)
+
+
+    def test_RegistrationNotificationWithAddressString(self, asys, asys2):
+        unsupported(asys)
+
+        notifications = asys.createActor(NotificationHandler)
+        asys.tell(notifications, True)
+
+        asys.updateCapability('dog', 'food')
+        asys2.updateCapability('barn', 'oats')
+
+        regActor = asys.createActor(PreRegistrationActor)
+        raises(NoCompatibleSystemForActor, asys.createActor, Horse)
+        raises(NoCompatibleSystemForActor, asys.createActor, Cow)
+
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        assert not notes
+
+        rsp = asys.ask(regActor, ("Register", "127.0.0.1:%d"%(asys2.port_num),
+                                  {'moo': True}),
+                       MAX_ASK_DELAY)
+        wait_for_registration()
+        showAdminStatus(asys)
+        showAdminStatus(asys2)
+
+        # wait and show should allow actual conventionregistration for
+        # full set of remote capabilities.
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        print('notes:',fmap(str, notes))
+        assert len(notes) == 1
+        for each in notes:
+            assert isinstance(each.remoteAdminAddress, ActorAddress)
+            # Actual registration should have actual capabilities
+            assert 'barn' in each.remoteCapabilities
+            assert each.remoteCapabilities['barn'] == 'oats'
+            assert 'Thespian Version' in each.remoteCapabilities
+            assert each.remoteAdded
+
+        horse = asys.createActor(Horse)
+        assert asys.ask(horse, 'bor', MAX_ASK_DELAY) == 'Neigh: bor'
+
+        # Verify that deregistration can be performed with the remote
+        # admin address and that there is a corresponding
+        # notification.
+
+        rsp = asys.ask(regActor, ("Deregister",
+                                  "127.0.0.1:%d"%(asys2.port_num)),
+                                  MAX_ASK_DELAY)
+
+        wait_for_registration()
+        showAdminStatus(asys)
+        showAdminStatus(asys2)
+
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        print(fmap(repr, notes))
+        assert len(notes) == 1
+        for each in notes:
+            print(':: %s @ %s : %s' %
+                  (each.remoteAdded,
+                   str(each.remoteAdminAddress),
+                   str(each.remoteCapabilities)))
+            assert isinstance(each.remoteAdminAddress, ActorAddress)
+            # Actual registration should have actual capabilities
+            assert 'barn' in each.remoteCapabilities
+            assert each.remoteCapabilities['barn'] == 'oats'
+            assert 'Thespian Version' in each.remoteCapabilities
+            # Still a member because it is distinct from the added
+            # version
+            assert not each.remoteAdded
+
+
+    def test_RegistrationNotificationWithActorAddress(self, asys, asys2):
+        unsupported(asys)
+
+        notifications = asys.createActor(NotificationHandler)
+        asys.tell(notifications, True)
+
+        asys.updateCapability('dog', 'food')
+        asys2.updateCapability('barn', 'oats')
+
+        regActor = asys.createActor(PreRegistrationActor)
+        raises(NoCompatibleSystemForActor, asys.createActor, Horse)
+        raises(NoCompatibleSystemForActor, asys.createActor, Cow)
+
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        assert not notes
+
+        print('notification address:',str(notifications))
+        myaddr = str(notifications).split('|')[1].split(':')[0]
+        print('myaddr:',myaddr)
+
+        rsp = asys.ask(regActor, ("Register",
+                                  "%s:%d"%(myaddr, asys2.port_num),
+                                  {'moo': True}),
+                       MAX_ASK_DELAY)
+        wait_for_registration()
+        showAdminStatus(asys)
+        showAdminStatus(asys2)
+
+        # wait and show should allow actual convention registration for
+        # full set of remote capabilities, then verify that this has
+        # occurred.
+        wait_for_registration()  # allow convention registration
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        print(fmap(str, notes))
+        assert len(notes) == 1
+        for each in notes:
+            print(':: %s @ %s : %s' %
+                  (each.remoteAdded,
+                   str(each.remoteAdminAddress),
+                   str(each.remoteCapabilities)))
+            assert isinstance(each.remoteAdminAddress, ActorAddress)
+            rmtAdmin = each.remoteAdminAddress
+            # Actual registration should have actual capabilities
+            assert 'barn' in each.remoteCapabilities
+            assert each.remoteCapabilities['barn'] == 'oats'
+            assert 'Thespian Version' in each.remoteCapabilities
+            assert each.remoteAdded
+
+        horse = asys.createActor(Horse)
+        assert asys.ask(horse, 'bor', MAX_ASK_DELAY) == 'Neigh: bor'
+
+        # Verify that deregistration can be performed with the remote
+        # admin address and that there is a corresponding
+        # notification.
+
+        rsp = asys.ask(regActor, ("Deregister", rmtAdmin), MAX_ASK_DELAY)
+
+        wait_for_registration()
+        showAdminStatus(asys)
+        showAdminStatus(asys2)
+
+        notes = asys.ask(notifications, 'get', MAX_ASK_DELAY)
+        print(fmap(repr, notes))
+        assert len(notes) == 1
+        for each in notes:
+            print(':: %s @ %s : %s' %
+                  (each.remoteAdded,
+                   str(each.remoteAdminAddress),
+                   str(each.remoteCapabilities)))
+            assert isinstance(each.remoteAdminAddress, ActorAddress)
+            # Actual registration should have actual capabilities
+            assert 'barn' in each.remoteCapabilities
+            assert each.remoteCapabilities['barn'] == 'oats'
+            assert 'Thespian Version' in each.remoteCapabilities
+            assert not each.remoteAdded
 
 
     def testBadRegistrationAddress(self, asys, asys2):
@@ -100,6 +267,7 @@ class TestFuncRegistration(object):
                                   {'barn': 'oats'}),
                        timedelta(seconds=2))
         assert rsp == "OK"
+        wait_for_registration()
 
         horse = asys.createActor(Horse)
         assert asys.ask(horse, 'bor', 2) == 'Neigh: bor'
@@ -108,6 +276,7 @@ class TestFuncRegistration(object):
         rsp = asys.ask(regActor, ("Deregister", "127.0.0.1:%d"%asys2.port_num),
                        timedelta(seconds=2))
         assert rsp == "OK"
+        wait_for_registration()
         showAdminStatus(asys)
         showAdminStatus(asys2)
 
@@ -134,6 +303,7 @@ class TestFuncRegistration(object):
                                   {'barn': 'oats'}),
                        timedelta(seconds=2))
         assert rsp == "OK"
+        wait_for_registration()
 
         horse = asys.createActor(Horse)
         assert asys.ask(horse, 'bor', 2) == 'Neigh: bor'

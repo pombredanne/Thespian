@@ -17,9 +17,9 @@
 '''
 
 import logging, string, types, functools
-from datetime import datetime, timedelta
 from thespian.actors import *
-from thespian.system.utilis import actualActorClass, timePeriodSeconds, toTimeDeltaOrNone
+from thespian.system.utilis import (actualActorClass, partition)
+from thespian.system.timing import timePeriodSeconds, toTimeDeltaOrNone, ExpirationTimer
 try:
     from logging.config import dictConfig
 except ImportError:
@@ -29,6 +29,7 @@ from thespian.system import isInternalActorSystemMessage
 from thespian.system.messages.status import *
 from thespian.system.sourceLoader import loadModuleFromHashSource, SourceHashFinder
 import time
+import traceback
 
 
 class ActorRef:
@@ -87,6 +88,9 @@ class ActorRef:
 
     def registerSourceAuthority(self, address):
         self._system._systemBase.registerSourceAuthority(address)
+
+    def notifyOnSourceAvailability(self, address, enable):
+        self._system._systemBase.registerSourceNotifications(address, enable)
 
     def updateCapability(self, capabilityName, capabilityValue):
         self._system.updateCapability(capabilityName, capabilityValue)
@@ -167,7 +171,7 @@ def actor_base_receive(actorInst, msg, sender):
             logging.getLogger('Thespian').warning('Actor "%s" double-draught of poison; discarding',
                                                   actorInst)
         else:
-            actorInst.send(sender, PoisonMessage(msg))
+            actorInst.send(sender, PoisonMessage(msg, traceback.format_exc()))
 
 
 class actorLogFilter(logging.Filter):
@@ -213,9 +217,32 @@ defaultLoggingConfig = {
 }
 
 
-class ActorSystemBase:
+class WakeupManager(object):
+    def __init__(self):
+        # _wakeUps is a list of (targetAddress, ExpirationTimer)
+        self._wakeUps = []
+
+    def _pop_expired_wakeups(self):
+        exp, self._wakeUps = partition(lambda E: E[1].expired(), self._wakeUps)
+        return exp
+
+    def _next_wakeup(self):
+        "Returns the ExpirationTimer for the next wakeup to occur"
+        return min([T for A,T in self._wakeUps]) if self._wakeUps else None
+
+    def _add_wakeup(self, from_actor, time_period):
+        self._wakeUps.append( (from_actor, ExpirationTimer(time_period)) )
+
+    def add_wakeups_to_status(self, statusmsg):
+        statusmsg.addWakeups(self._wakeUps)
+        return statusmsg
+
+
+
+class ActorSystemBase(WakeupManager):
 
     def __init__(self, system, logDefs = None):
+        super(ActorSystemBase, self).__init__()
         self.system = system
         self._pendingSends = []
         if logDefs is not False: dictConfig(logDefs or defaultLoggingConfig)
@@ -223,12 +250,9 @@ class ActorSystemBase:
         self._primaryCount  = 0
         self._globalNames = {}
         self.procLimit = 0
-        self._wakeUps = {}  # key = datetime for wakeup, value = list
-                            # of (targetAddress, pending
-                            # WakeupMessage) to restart at
-                            # that time
         self._sources = {}  # key = sourcehash, value = encrypted zipfile data
         self._sourceAuthority = None  # ActorAddress of Source Authority
+        self._sourceNotifications = [] # list of actor addresses to notify of loads
         asys = self._newRefAndActor(system, system.systemAddress,
                                     system.systemAddress,
                                     External)
@@ -257,48 +281,41 @@ class ActorSystemBase:
             self.unloadActorSource(list(self._sources.keys())[0])
 
 
-    def _realizeWakeups(self):
-        "Find any expired wakeups and queue them to the send processing queue"
-        now = datetime.now()
-        removals = []
-        for wakeupTime in self._wakeUps:
-            if wakeupTime > now:
-                continue
-            self._pendingSends.extend([PendingSend(A,M,A) for A,M in self._wakeUps[wakeupTime]])
-            removals.append(wakeupTime)
-        for each in removals:
-            del self._wakeUps[each]
-
-
-    def _runSends(self, timeout=None):
+    def _runSends(self, timeout=None, stop_on_available=False):
         numsends = 0
-        endtime = ((datetime.now() + toTimeDeltaOrNone(timeout))
-                   if timeout else None)
-        while not endtime or datetime.now() < endtime:
+        endtime = ExpirationTimer(toTimeDeltaOrNone(timeout))
+        while not endtime.expired():
             while self._pendingSends:
                 numsends += 1
                 if self.procLimit and numsends > self.procLimit:
                     raise RuntimeError('Too many sends')
                 self._realizeWakeups()
                 self._runSingleSend(self._pendingSends.pop(0))
-            if not endtime:
+                if stop_on_available and \
+                   any([not isInternalActorSystemMessage(M)
+                        for M in getattr(stop_on_available.instance,
+                                         'responses', [])]):
+                    return
+            if endtime.remaining(forever=-1) == -1:
                 return
-            now = datetime.now()
-            valid_wakeups = [(W-now) for W in self._wakeUps if W <= endtime]
-            if not valid_wakeups:
+            next_wakeup = self._next_wakeup()
+            if next_wakeup is None or next_wakeup > endtime:
                 return
-            import time
-            time.sleep(max(0, timePeriodSeconds(min(valid_wakeups))))
+            time.sleep(max(0, timePeriodSeconds(next_wakeup.remaining())))
             self._realizeWakeups()
 
 
     def _runSingleSend(self, ps):
         if ps.attempts > 4:
-            return  # discard message if PoisonMessage deliveries are also failing
+            # discard message if PoisonMessage deliveries are also
+            # failing
+            return
         elif ps.attempts > 2:
             if isinstance(ps.msg, PoisonMessage):
-                return # no recursion on Poison
-            rcvr, sndr, msg = ps.sender, ps.toActor, PoisonMessage(ps.msg)
+                return  # no recursion on Poison
+            rcvr, sndr, msg = ps.sender, ps.toActor, \
+                              PoisonMessage(ps.msg,
+                                            getattr(ps, 'fail_details', None))
         else:
             rcvr, sndr, msg = ps.toActor, ps.sender, ps.msg
 
@@ -336,6 +353,12 @@ class ActorSystemBase:
                 self.actorRegistry[deadAddr] = None
 
 
+    def _realizeWakeups(self):
+        "Find any expired wakeups and queue them to the send processing queue"
+        for target_addr, expired in self._pop_expired_wakeups():
+            self._pendingSends.append(
+                PendingSend(target_addr, WakeupMessage(expired.duration), target_addr))
+
     def _callActorWithMessage(self, tgt, ps, msg, sndr):
         try:
             # This if is to avoid sending PoisonMessage(ChildActorExited) back to child
@@ -347,6 +370,7 @@ class ActorSystemBase:
                 tgt.address, ps.attempts,
                 exc_info = True)
             ps.attempts += 1
+            ps.fail_details = traceback.format_exc()
             self._pendingSends.append(ps)
         else:
             if isinstance(ps.msg, ChildActorExited):
@@ -367,6 +391,8 @@ class ActorSystemBase:
             if self._globalNames[gn] == ps.toActor:
                 del self._globalNames[gn]
                 break
+        self._sourceNotifications = list(filter(lambda N: N != ps.toActor,
+                                                self._sourceNotifications))
         tgt._system._systemBase.actor_send(
             self.actorRegistry[self.system.systemAddress.actorAddressString].address,
             tgt.parent,
@@ -374,11 +400,10 @@ class ActorSystemBase:
 
 
     def _generateStatusResponse(self, msg, tgt, sndr):
-        pendWake = [W for K,E in self._wakeUps.items() for T,W in E if T == tgt.address]
         stsresp = Thespian_ActorStatus(tgt.address,
                                        tgt.instance.__class__.__name__,
                                        tgt._system.systemAddress)
-        stsresp.addWakeups(self._wakeUps)
+        stsresp = self.add_wakeups_to_status(stsresp)
         for C in tgt._yung: stsresp.addChild(C)
         for M in self._pendingSends:
             if M[1] == tgt.address:
@@ -497,8 +522,8 @@ class ActorSystemBase:
         # check remaining time between Actor calls and return if the
         # timeout period has been exceeded, but that still wouldn't
         # allow interruption of blocked Actors.
-        self._runSends(timeout)
         sender = self.actorRegistry['System:ExternalRequester']
+        self._runSends(timeout, stop_on_available=sender)
         while getattr(sender.instance, 'responses', None):
             response = sender.instance.responses.pop(0)
             if isInternalActorSystemMessage(response): continue
@@ -509,8 +534,7 @@ class ActorSystemBase:
         self._pendingSends.append(PendingSend(fromActor, msg, toActor))
 
     def wakeupAfter(self, fromActor, timePeriod):
-        wakeupTime = datetime.now() + timePeriod
-        self._wakeUps.setdefault(wakeupTime, []).append( (fromActor, WakeupMessage(timePeriod)) )
+        self._add_wakeup(fromActor, timePeriod)
         self._realizeWakeups()
 
     def _handleDeadLetters(self, address, enable):
@@ -537,6 +561,17 @@ class ActorSystemBase:
     def registerSourceAuthority(self, address):
         self._sourceAuthority = address
 
+
+    def registerSourceNotifications(self, address, enable):
+        all_except = list(filter(lambda a: a != address, self._sourceNotifications))
+        if enable:
+            self._sourceNotifications = all_except + [address]
+            for each_hash in self._sources:
+                self.actor_send(self.system.systemAddress,
+                                address,
+                                LoadedSource(each_hash, ''))  # no info available
+        else:
+            self._sourceNotifications = all_except
 
     def loadActorSource(self, fname):
         import hashlib
@@ -575,10 +610,21 @@ class ActorSystemBase:
         # Store this registered source
         self._sources[sourceHash] = sourceZip
 
+        # Generate notifications
+        for each_target in self._sourceNotifications:
+            self.actor_send(self.system.systemAddress, each_target,
+                            LoadedSource(sourceHash, ''))  # no info available
+
 
     def unloadActorSource(self, sourceHash):
         if sourceHash in self._sources:
             del self._sources[sourceHash]
+
+            # Generate notifications
+            for each_target in self._sourceNotifications:
+                self.actor_send(self.system.systemAddress, each_target,
+                                UnloadedSource(sourceHash, ''))  # no info available
+
         for pnum, metapath in enumerate(sys.meta_path):
             if getattr(metapath, 'srcHash', None) == sourceHash:
                 rmmods = [M for M in sys.modules

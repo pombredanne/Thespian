@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name = 'thespian',
-    version = '3.0.1',
+    version = '3.6.3',
     description = 'Python Actor concurrency library',
     author = 'Kevin Quick, GoDaddy',
     author_email = 'kquick@godaddy.com',
@@ -22,6 +22,7 @@ setup(
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: Implementation :: CPython',
         'Programming Language :: Python :: Implementation :: PyPy',
         'Topic :: System :: Distributed Computing',

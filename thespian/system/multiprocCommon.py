@@ -40,8 +40,8 @@ for sname in ['SIGCHLD']:
     except AttributeError:
         pass   # not defined for this OS
 
-#set_signal_handler = signal.signal
-set_signal_handler = lambda *args: None
+set_signal_handler = signal.signal
+#set_signal_handler = lambda *args: None
 
 
 def detach_child(childref):
@@ -54,6 +54,21 @@ def detach_child(childref):
             multiprocessing.process._current_process._children.remove(childref)
 
 
+def get_multiproc_context(capabilities):
+    best_concurrency = capabilities.get('Process Startup Method', 'fork')
+    if hasattr(multiprocessing, 'get_context'):
+        for each in (best_concurrency, 'fork', 'spawn'):
+            if hasattr(multiprocessing, 'get_all_start_methods'):
+                if each in multiprocessing.get_all_start_methods():
+                    return multiprocessing.get_context(each)
+            else:
+                try:
+                    return multiprocessing.get_context(each)
+                except ValueError:
+                    pass # invalid concurrency for this system
+    return None
+
+
 class multiprocessCommon(systemBase):
 
     def __init__(self, system, logDefs = None):
@@ -61,24 +76,28 @@ class multiprocessCommon(systemBase):
         system.capabilities['Python Version'] = tuple(sys.version_info)
         system.capabilities['Thespian Generation'] = ThespianGeneration
         system.capabilities['Thespian Version'] = str(int(time.time()*1000))
+        self.mpcontext = get_multiproc_context(system.capabilities)
 
         self.transport = self.transportType(ExternalInterfaceTransportInit(),
-                                            system.capabilities, logDefs)
+                                            system.capabilities, logDefs,
+                                            self.mpcontext)
         super(multiprocessCommon, self).__init__(system, logDefs)
 
 
     def _startAdmin(self, adminAddr, addrOfStarter, capabilities, logDefs):
+        mp = self.mpcontext if self.mpcontext else multiprocessing
         endpointPrep = self.transport.prepEndpoint(adminAddr, capabilities)
 
         multiprocessing.process._current_process._daemonic = False
-        admin = multiprocessing.Process(target=startAdmin,
+        admin = mp.Process(target=startAdmin,
                                         args=(MultiProcAdmin,
                                               addrOfStarter,
                                               endpointPrep,
                                               self.transport.__class__,
                                               adminAddr,
                                               capabilities,
-                                              logDefs),
+                                              logDefs,
+                                              self.mpcontext),
                                         name='ThespianAdmin')
         admin.start()
         # admin must be explicity shutdown and is not automatically
@@ -124,7 +143,7 @@ def signal_admin_sts(admin):
 
 
 def startAdmin(adminClass, addrOfStarter, endpointPrep, transportClass,
-               adminAddr, capabilities, logDefs):
+               adminAddr, capabilities, logDefs, concurrency_context):
     # Unix Daemonization; skipped if not available
     import os,sys
     if hasattr(os, 'setsid'):
@@ -146,7 +165,8 @@ def startAdmin(adminClass, addrOfStarter, endpointPrep, transportClass,
     # _verifyAdminRunning to ensure things are OK.
     transport = transportClass(endpointPrep)
     try:
-        admin = adminClass(transport, adminAddr, capabilities, logDefs)
+        admin = adminClass(transport, adminAddr, capabilities, logDefs,
+                           concurrency_context)
     except Exception:
         transport.scheduleTransmit(None,
                                    TransmitIntent(addrOfStarter, EndpointConnected(0)))
@@ -154,7 +174,8 @@ def startAdmin(adminClass, addrOfStarter, endpointPrep, transportClass,
     # Send of EndpointConnected is deferred until the logger is setup.  See MultiProcReplicator.h_LoggerConnected below.
 
     admin.addrOfStarter = addrOfStarter
-    setProcName(adminClass.__name__, admin.transport.myAddress)
+    setProcName(adminClass.__name__.rpartition('.')[-1],
+                admin.transport.myAddress)
 
     # Admin does not do normal signal handling, but does want to know if children exit
     for each in range(1, signal.NSIG):
@@ -164,16 +185,24 @@ def startAdmin(adminClass, addrOfStarter, endpointPrep, transportClass,
         # behavior.
         if each not in uncatchable_signals:
             if each in child_exit_signals:
-                set_signal_handler(each, admin.childDied)
+                set_signal_handler(each, admin.signalChildDied)
     if hasattr(signal, 'SIGUSR1'):
         set_signal_handler(signal.SIGUSR1, signal_admin_sts(admin))
 
-    _startLogger(transportClass, transport, admin, capabilities, logDefs)
+    _startLogger(transportClass, transport, admin, capabilities, logDefs,
+                 concurrency_context)
     #closeUnusedFiles(transport)
+
+    # Admin should never enter TX-only flow control state because this
+    # could deadlock or other non-progress conditions, especially if
+    # using admin routing.
+    transport.enableRXPauseFlowControl(False)
+
     admin.run()
 
 
-def _startLogger(transportClass, transport, admin, capabilities, logDefs):
+def _startLogger(transportClass, transport, admin, capabilities, logDefs,
+                 concurrency_context):
     # Generate the "placeholder" loggerAddr directly instead of going
     # through the AddressManager because the logger is not managed as
     # a normal child.
@@ -186,10 +215,14 @@ def _startLogger(transportClass, transport, admin, capabilities, logDefs):
         except Exception as ex:
             thesplog('Unable to adapt log aggregator address "%s" to a transport address: %s',
                      logAggregator, ex, level=logging.WARNING)
-    admin.asLogProc = startASLogger(loggerAddr, logDefs, transport, capabilities,
+    admin.asLogProc = startASLogger(loggerAddr,
+                                    logDefs,
+                                    transport,
+                                    capabilities,
                                     logAggregator
                                     if logAggregator != admin.transport.myAddress
-                                    else None)
+                                    else None,
+                                    concurrency_context)
 
 
 class ChildInfo(object):
@@ -205,13 +238,16 @@ class ChildInfo(object):
                                                str(self.childProc))
 
 
-def startASLogger(loggerAddr, logDefs, transport, capabilities, aggregatorAddress=None):
+def startASLogger(loggerAddr, logDefs, transport, capabilities,
+                  aggregatorAddress=None,
+                  concurrency_context = None):
     endpointPrep = transport.prepEndpoint(loggerAddr, capabilities)
     multiprocessing.process._current_process._daemonic = False
-    logProc = multiprocessing.Process(target=startupASLogger,
-                                      args = (transport.myAddress, endpointPrep,
-                                              logDefs,
-                                              transport.__class__, aggregatorAddress))
+    NewProc = concurrency_context.Process if concurrency_context else multiprocessing.Process
+    logProc = NewProc(target=startupASLogger,
+                      args = (transport.myAddress, endpointPrep,
+                              logDefs,
+                              transport.__class__, aggregatorAddress))
     logProc.daemon = True
     logProc.start()
     transport.connectEndpoint(endpointPrep)
@@ -224,6 +260,11 @@ def startASLogger(loggerAddr, logDefs, transport, capabilities, aggregatorAddres
 
 
 class MultiProcReplicator(object):
+
+
+    def init_replicator(self, transport, concurrency_context):
+        self.mpcontext = concurrency_context
+
 
     def _startChildActor(self, childAddr, childClass, parentAddr, notifyAddr,
                          childRequirements=None,
@@ -254,11 +295,24 @@ class MultiProcReplicator(object):
         if self.asLogger is None:
             raise ActorSystemFailure('logger ADDR cannot be None!')
 
-        if not checkActorCapabilities(childClass, self.capabilities, childRequirements,
-                                      partial(loadModuleFromHashSource,
-                                              sourceHash,
-                                              { sourceHash: sourceToLoad })
-                                      if sourceHash else None):
+        try:
+            if not checkActorCapabilities(childClass, self.capabilities, childRequirements,
+                                          partial(loadModuleFromHashSource,
+                                                  sourceHash,
+                                                  { sourceHash: sourceToLoad })
+                                          if sourceHash # and sourceToLoad
+                                          else None):
+                raise NoCompatibleSystemForActor(childClass,
+                                                 "no system has compatible capabilities")
+        except (InvalidActorSourceHash, ImportError):
+            # Allow these exceptions to propagate outward since they
+            # have special, public meaning
+            raise
+        except Exception:
+            # Most exceptions should be converted to
+            # NoCompatibleSystemForActor so that calling code
+            # recognizes this issue and defers the create request to
+            # the Admin.
             raise NoCompatibleSystemForActor(childClass,
                                              "no system has compatible capabilities")
 
@@ -271,7 +325,9 @@ class MultiProcReplicator(object):
         # is an argument passed to the child.
         fileNumsToClose = list(self.transport.childResetFileNumList())
 
-        child = multiprocessing.Process(target=startChild,  #KWQ: instantiates module specified by sourceHash to create actor
+        mp = self.mpcontext if self.mpcontext else multiprocessing
+
+        child = mp.Process(target=startChild,  #KWQ: instantiates module specified by sourceHash to create actor
                                         args=(childClass,
                                               endpointPrep,
                                               self.transport.__class__,
@@ -283,7 +339,8 @@ class MultiProcReplicator(object):
                                               self.asLogger,
                                               childRequirements,
                                               self.capabilities,
-                                              fileNumsToClose),
+                                              fileNumsToClose,
+                                              self.mpcontext),
                                         name='Actor_%s__%s'%(getattr(childClass, '__name__', childClass), str(childAddr)))
         child.start()
         # Also note that while non-daemonic children cause the current
@@ -313,18 +370,25 @@ class MultiProcReplicator(object):
     def _childExited(self, childAddr):
         children = getattr(self, '_child_procs', [])
         self._child_procs = list(filter(self._checkChildLiveness, children))
-        if len(children) == len(self._child_procs):
-            # Sometimes the child doesn't indicate as not alive immediately.
-            import time
-            time.sleep(0.1)
-            self._child_procs = list(filter(self._checkChildLiveness, children))
+        # The following is obsolete with active signal handling which
+        # will re-examine child liveness on SIGCHLD.
+        #
+        # if len(children) == len(self._child_procs):
+        #     # Sometimes the child doesn't indicate as not alive immediately.
+        #     import time
+        #     time.sleep(0.1)
+        #     self._child_procs = list(filter(self._checkChildLiveness, children))
 
-    def childDied(self, signum, frame):
+    def signalChildDied(self, _signum, _frame):
+        self.transport.interrupt_wait(check_children=True)
+
+    def childDied(self):
         logproc = getattr(self, 'asLogProc', None)
         if logproc and not self._checkChildLiveness(logproc):
             # Logger has died; need to start another
             if not hasattr(self, '_exiting'):
-                _startLogger(self.transport.__class__, self.transport, self, self.capabilities, self.logdefs)
+                _startLogger(self.transport.__class__, self.transport, self, self.capabilities, self.logdefs,
+                             self.mpcontext)
         # Signal handler for SIGCHLD; figure out which child and synthesize a ChildActorExited to handle it
         self._child_procs, dead = partition(self._checkChildLiveness,  getattr(self, '_child_procs', []))
         for each in dead:
@@ -335,6 +399,7 @@ class MultiProcReplicator(object):
             except CannotPickleAddress:
                 thesplog('child %s is dead but cannot translate address to properly handle it',
                          addr, level=logging.ERROR)
+        return True  # keep going
 
     def h_EndpointConnected(self, envelope):
         for C in getattr(self, '_child_procs', []):
@@ -376,6 +441,8 @@ class MultiProcReplicator(object):
             return True, self.h_EndpointConnected(envelope)
         if isinstance(envelope.message, logging.LogRecord):
             return True, self.h_LogRecord(envelope)
+        if isinstance(envelope.message, ChildMayHaveDied):
+            return True, self.childDied()
         return False, True
 
 
@@ -417,8 +484,7 @@ def shutdown_signal_detector(name, addr, am):
     def shutdown_signal_detected(signum, frame):
         thesplog('Actor %s @ %s got shutdown signal: %s', name, addr, signum,
                  level = logging.WARNING)
-        am.transport.scheduleTransmit(None, TransmitIntent(am.transport.myAddress,
-                                                           ActorExitRequest()))
+        am.transport.interrupt_wait(signal_shutdown=True)
     return shutdown_signal_detected
 
 
@@ -426,7 +492,7 @@ def startChild(childClass, endpoint, transportClass,
                sourceHash, sourceToLoad,
                parentAddr, adminAddr, notifyAddr, loggerAddr,
                childRequirements, currentSystemCapabilities,
-               fileNumsToClose):
+               fileNumsToClose, concurrency_context):
 
     closeFileNums(fileNumsToClose)
 
@@ -463,12 +529,15 @@ def startChild(childClass, endpoint, transportClass,
     am = MultiProcManager(childClass, transport,
                           sourceHash, sourceToLoad,
                           parentAddr, adminAddr,
-                          childRequirements, currentSystemCapabilities)
+                          childRequirements, currentSystemCapabilities,
+                          concurrency_context)
     am.asLogger = loggerAddr
     am.transport.scheduleTransmit(None,
                                   TransmitIntent(notifyAddr,
                                                  EndpointConnected(endpoint.addrInst)))
-    setProcName(getattr(childClass, '__name__', str(childClass)), am.transport.myAddress)
+    setProcName(getattr(childClass, '__name__',
+                        str(childClass)).rpartition('.')[-1],
+                am.transport.myAddress)
 
     sighandler = signal_detector(getattr(childClass, '__name__', str(childClass)),
                                  am.transport.myAddress, am)
@@ -483,7 +552,7 @@ def startChild(childClass, endpoint, transportClass,
         # behavior.
         if each not in uncatchable_signals:
             if each in child_exit_signals:
-                set_signal_handler(each, am.childDied)
+                set_signal_handler(each, am.signalChildDied)
                 continue
             try:
                 set_signal_handler(each,
